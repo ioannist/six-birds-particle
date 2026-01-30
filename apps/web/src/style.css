@@ -1,0 +1,454 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --panel: #111826;
+  --text: #e6edf3;
+  --muted: #97a3b3;
+  --border: rgba(255, 255, 255, 0.12);
+  --accent: #6aa9ff;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica,
+    Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: 100vh;
+}
+
+.panel {
+  padding: 16px;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.panel h1 {
+  font-size: 16px;
+  margin: 0 0 8px 0;
+}
+
+.panel p {
+  margin: 0 0 12px 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.row.twoCol {
+  grid-template-columns: 1fr 1fr;
+}
+
+.panel label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.panel input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.panel select {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.panel button {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.panel button.primary {
+  border-color: rgba(106, 169, 255, 0.55);
+  background: rgba(106, 169, 255, 0.18);
+}
+
+.panel button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.primitiveToggle {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.primitiveToggle label {
+  display: grid;
+  grid-template-columns: 18px 12px 1fr;
+  align-items: center;
+  column-gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.primitiveLabel {
+  white-space: nowrap;
+}
+
+.primitiveToggle input[type="checkbox"] {
+  accent-color: var(--accent);
+  justify-self: center;
+}
+
+.legendSwatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  display: inline-block;
+}
+
+.legendSwatch--P1 {
+  background: rgba(80, 170, 255, 0.9);
+}
+
+.legendSwatch--P2 {
+  background: rgba(255, 170, 80, 0.9);
+}
+
+.legendSwatch--P4 {
+  background: rgba(120, 230, 120, 0.9);
+}
+
+.legendSwatch--P5 {
+  background: rgba(220, 120, 230, 0.9);
+}
+
+.legendSwatch--P3 {
+  background: rgba(255, 230, 80, 0.9);
+}
+
+.legendSwatch--P6 {
+  background: rgba(255, 120, 120, 0.9);
+}
+
+.accordion {
+  margin-bottom: 12px;
+  padding: 10px 12px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.accordionTitle {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0;
+  padding: 4px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 0.2s;
+}
+
+.accordionTitle:hover {
+  color: var(--text);
+}
+
+.accordionTitle span {
+  font-size: 10px;
+  transition: transform 0.2s;
+}
+
+.accordionContent {
+  margin-top: 12px;
+}
+
+.main {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.canvasWrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: 16px;
+}
+
+canvas {
+  width: min(92vmin, 980px);
+  height: auto;
+  aspect-ratio: 1 / 1;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.chartsPanel {
+  padding: 12px 16px 14px;
+  background: linear-gradient(180deg, rgba(11, 15, 20, 0.1), rgba(11, 15, 20, 0.85));
+  border-top: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.sStackSection {
+  grid-column: 1 / -1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.sStackHeader {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sStackTitle {
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.sStackControls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.sStackControls label {
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sStackControls select,
+.sStackControls input {
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.sStackGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.sStackCard {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.sStackLabel {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.sStackCanvas {
+  width: 140px;
+  height: 140px;
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sStackStats {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.metaAlignSection {
+  grid-column: 1 / -1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.metaAlignHeader {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.metaAlignTitle {
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.metaAlignControls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.metaAlignControls button {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.metaAlignControls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.metaAlignBaseline {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.metaAlignGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.metaAlignCard {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.metaAlignLabel {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.metaAlignValue {
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.metaAlignCanvas {
+  width: 100%;
+  height: 58px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.chartCard {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 6px;
+  min-height: 86px;
+}
+
+.chartCard--P1 {
+  background: rgba(106, 169, 255, 0.08);
+}
+
+.chartCard--P2 {
+  background: rgba(140, 200, 255, 0.08);
+}
+
+.chartCard--P4 {
+  background: rgba(120, 210, 180, 0.08);
+}
+
+.chartCard--P5 {
+  background: rgba(160, 220, 140, 0.08);
+}
+
+.chartCard--P3 {
+  background: rgba(240, 210, 80, 0.1);
+}
+
+.chartCard--System {
+  background: rgba(255, 205, 120, 0.08);
+}
+
+.chartCard--Graph {
+  background: rgba(255, 170, 160, 0.08);
+}
+
+.chartLabel {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.chartCard canvas {
+  width: 100%;
+  height: 58px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}

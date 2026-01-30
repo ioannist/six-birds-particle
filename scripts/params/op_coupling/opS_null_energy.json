@@ -1,0 +1,20 @@
+{
+  "beta": 1.0,
+  "gridSize": 16,
+  "metaLayers": 2,
+  "lS": 6,
+  "lambdaS": 0.5,
+  "p3On": 0,
+  "p6On": 0,
+  "pWrite": 0,
+  "pNWrite": 0,
+  "pAWrite": 0,
+  "pSWrite": 1,
+  "eta": 0.6,
+  "etaDrive": 0.0,
+  "opCouplingOn": 1,
+  "sCouplingMode": 1,
+  "opStencil": 1,
+  "opBudgetK": 16,
+  "opDriveOnK": 1
+}

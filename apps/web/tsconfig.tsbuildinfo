@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/sim/runCache.ts","./src/sim/sim.worker.ts","./src/sim/workerClient.ts","./src/sim/workerMessages.ts","./src/wasm/sim_core/sim_core.d.ts","./src/wasm/sim_core/sim_core_bg.wasm.d.ts"],"version":"5.9.3"}

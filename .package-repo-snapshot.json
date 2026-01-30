@@ -1,0 +1,40 @@
+{
+  "allowed_roots": {
+    "apps": {
+      "extensions": [".ts", ".tsx", ".css", ".html", ".json", ".md", ".svg", ".png", ".jpg", ".jpeg", ".wasm"]
+    },
+    "crates": {
+      "extensions": [".rs", ".toml", ".md"]
+    },
+    "docs": {
+      "extensions": [".md", ".tex", ".pdf", ".png", ".jpg", ".jpeg", ".svg"]
+    },
+    "scripts": {
+      "extensions": [".sh", ".mjs", ".js", ".json", ".md", ".py", ".txt"]
+    }
+  },
+  "allowed_root_files": [
+    "AGENTS.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "EXPERIMENTS.md",
+    "Makefile",
+    "NOTE-TO-SELF.md",
+    "README.md",
+    ".gitignore",
+    ".package-repo-snapshot.json",
+    ".repomixrc",
+    "repomix-output.xml"
+  ],
+  "exclude_dirs": [
+    ".git",
+    ".lake",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".ipynb_checkpoints"
+  ]
+}
