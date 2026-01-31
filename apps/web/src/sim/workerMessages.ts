@@ -43,20 +43,28 @@ export type SimParams = {
   sCouplingMode: number;
   opStencil: number;
   opBudgetK: number;
+  opKTargetWeight: number;
   opDriveOnK: number;
 };
 
 export const SNAPSHOT_VERSION = 2 as const;
 
-export type SimConfigRequest = { type: "config"; bondThreshold: number; params: SimParams };
+export type SimConfigRequest = {
+  type: "config";
+  bondThreshold: number;
+  params: SimParams;
+  bondsEverySteps?: number;
+};
 export type SimPauseRequest = { type: "pause" };
 export type SimResumeRequest = { type: "resume" };
+export type SimPerturbRequest = { type: "perturb"; params: Record<string, unknown> };
 export type SimRequest =
   | SimInitRequest
   | SimStepRequest
   | SimConfigRequest
   | SimPauseRequest
-  | SimResumeRequest;
+  | SimResumeRequest
+  | SimPerturbRequest;
 
 export type EnergyBreakdown = {
   total: number;
@@ -103,7 +111,7 @@ export type Diagnostics = {
 export type EpSnapshotExtras = {
   exactTotal?: number;
   naiveTotal?: number;
-  exactByMove?: Record<string, number>;
+  exactByMove?: Float64Array;
 };
 
 export type ClockSnapshotExtras = {
@@ -113,7 +121,16 @@ export type ClockSnapshotExtras = {
   state?: number;
 };
 
-export type OpkSnapshotExtras = {};
+export type OpkSnapshotExtras = {
+  enabled?: boolean;
+  budgetK?: number;
+  interfaces?: number;
+  rCount?: number;
+  stencilId?: number;
+  offsets?: Int8Array;
+  tokens?: Uint8Array;
+  computedAtSteps?: number;
+};
 
 export type MaintenanceSnapshotExtras = {};
 

@@ -1,11 +1,51 @@
+import type { SimParams } from "./workerMessages";
+
+export const RUN_EXPORT_VERSION = 2 as const;
+
 export type RunMeta = {
   runId: number;
   startedAt: number;
   n: number;
   seed: number;
   bondThreshold: number;
-  params: unknown;
+  presetId?: string;
+  presetSourcePath?: string;
+  supports?: string[];
+  paramsApplied: SimParams;
   captureEverySteps: number;
+  uiConfig: {
+    snapshotVersion: number;
+    epWindowSteps: number;
+    certStabilityK: number;
+    turBlockSteps: number;
+    opkPayloadEverySteps: number;
+    maintEverySteps: number;
+    bondsEverySteps?: number;
+    bondsMode?: string;
+    graphStatsMode?: string;
+  };
+};
+
+export type SnapshotExtrasSummary = {
+  ep?: {
+    exactTotal?: number;
+    naiveTotal?: number;
+    exactByMove?: Float64Array;
+  };
+  clock?: {
+    q?: number;
+    fwd?: number;
+    bwd?: number;
+    state?: number;
+  };
+  opk?: {
+    enabled?: boolean;
+    budgetK?: number;
+    interfaces?: number;
+    rCount?: number;
+    stencilId?: number;
+    computedAtSteps?: number;
+  };
 };
 
 export type SnapshotEntry = {
@@ -13,6 +53,8 @@ export type SnapshotEntry = {
   index: number;
   t: number;
   n: number;
+  snapshotVersion: number;
+  totalSteps: number;
   energy: unknown;
   diagnostics: unknown;
   graphStats: unknown;
@@ -20,7 +62,14 @@ export type SnapshotEntry = {
   bonds: Uint32Array;
   counters: Int16Array;
   apparatus: Uint16Array;
-  field: Uint8Array;
+  baseSField: Uint8Array;
+  metaLayers: number;
+  metaS0?: Uint8Array | null;
+  metaS1?: Uint8Array | null;
+  metaW0?: Uint8Array | null;
+  metaW1?: Uint8Array | null;
+  extras?: SnapshotExtrasSummary;
+  metrics?: Record<string, unknown> | null;
   stepsDelta: number;
 };
 
@@ -136,6 +185,7 @@ export function addSnapshot(entry: Omit<SnapshotEntry, "runId" | "index" | "t">)
   if (stepAccumulator < captureEverySteps) return;
   stepAccumulator = stepAccumulator % captureEverySteps;
 
+  const extras = entry.extras;
   const snapshot: SnapshotEntry = {
     runId: runMeta.runId,
     index,
@@ -145,7 +195,24 @@ export function addSnapshot(entry: Omit<SnapshotEntry, "runId" | "index" | "t">)
     bonds: new Uint32Array(entry.bonds),
     counters: new Int16Array(entry.counters),
     apparatus: new Uint16Array(entry.apparatus),
-    field: new Uint8Array(entry.field),
+    baseSField: new Uint8Array(entry.baseSField),
+    metaS0: entry.metaS0 ? new Uint8Array(entry.metaS0) : entry.metaS0 ?? null,
+    metaS1: entry.metaS1 ? new Uint8Array(entry.metaS1) : entry.metaS1 ?? null,
+    metaW0: entry.metaW0 ? new Uint8Array(entry.metaW0) : entry.metaW0 ?? null,
+    metaW1: entry.metaW1 ? new Uint8Array(entry.metaW1) : entry.metaW1 ?? null,
+    extras: extras
+      ? {
+          ...extras,
+          ep: extras.ep
+            ? {
+                ...extras.ep,
+                exactByMove: extras.ep.exactByMove
+                  ? new Float64Array(extras.ep.exactByMove)
+                  : undefined,
+              }
+            : undefined,
+        }
+      : undefined,
   };
   index += 1;
   pending.push(snapshot);
@@ -209,7 +276,14 @@ export async function exportRun() {
 
   const parts: BlobPart[] = [];
   if (meta) {
-    parts.push(`${JSON.stringify({ type: "meta", ...meta })}\n`);
+    parts.push(
+      `${JSON.stringify({
+        type: "meta",
+        runExportVersion: RUN_EXPORT_VERSION,
+        exportedAt: Date.now(),
+        ...meta,
+      })}\n`
+    );
   }
 
   let wroteSnapshots = false;
@@ -251,12 +325,16 @@ export async function exportRun() {
 }
 
 function serializeSnapshot(entry: SnapshotEntry) {
+  const extras = entry.extras;
   return {
     type: "snapshot",
+    runExportVersion: RUN_EXPORT_VERSION,
     runId: entry.runId,
     index: entry.index,
     t: entry.t,
     n: entry.n,
+    snapshotVersion: entry.snapshotVersion,
+    totalSteps: entry.totalSteps,
     energy: entry.energy,
     diagnostics: entry.diagnostics,
     graphStats: entry.graphStats,
@@ -264,7 +342,26 @@ function serializeSnapshot(entry: SnapshotEntry) {
     bonds: Array.from(entry.bonds),
     counters: Array.from(entry.counters),
     apparatus: Array.from(entry.apparatus),
-    field: Array.from(entry.field),
+    baseSField: Array.from(entry.baseSField),
+    metaLayers: entry.metaLayers,
+    metaS0: entry.metaS0 ? Array.from(entry.metaS0) : null,
+    metaS1: entry.metaS1 ? Array.from(entry.metaS1) : null,
+    metaW0: entry.metaW0 ? Array.from(entry.metaW0) : null,
+    metaW1: entry.metaW1 ? Array.from(entry.metaW1) : null,
+    extras: extras
+      ? {
+          ...extras,
+          ep: extras.ep
+            ? {
+                ...extras.ep,
+                exactByMove: extras.ep.exactByMove
+                  ? Array.from(extras.ep.exactByMove)
+                  : undefined,
+              }
+            : undefined,
+        }
+      : undefined,
+    metrics: entry.metrics ?? null,
     stepsDelta: entry.stepsDelta,
   };
 }

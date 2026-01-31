@@ -1,4 +1,5 @@
 {
+  "repo_name": "six-birds-particle",
   "allowed_roots": {
     "apps": {
       "extensions": [".ts", ".tsx", ".css", ".html", ".json", ".md", ".svg", ".png", ".jpg", ".jpeg", ".wasm"]

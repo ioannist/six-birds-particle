@@ -7,6 +7,7 @@ import {
   setCaptureEverySteps,
   startRun,
 } from "./sim/runCache";
+import { SNAPSHOT_VERSION } from "./sim/workerMessages";
 import type { Diagnostics, EnergyBreakdown, SimParams } from "./sim/workerMessages";
 import { PRESET_CATALOG, type PresetEntry } from "./sim/presetCatalog";
 
@@ -500,12 +501,300 @@ const CERT_MIN_STEPS = EP_WINDOW_STEPS;
 const CERT_EP_EXACT_RATE_ABS_MAX = 2e-4;
 const CERT_SIGMA_MEM_ABS_MAX = 2e-3;
 const CERT_M6_ABS_MAX = 2e-3;
-const MAX_STACK_LAYERS = 4;
+const TUR_BLOCK_STEPS = 50000;
+const TUR_MIN_BLOCKS = 10;
+const TUR_SAMPLES_CAP = 200;
+const CERT_CLOCK_NULL_MIN_STEPS = 200000;
+const CERT_CLOCK_NULL_DRIFT_ABS_MAX = 5e-4;
+const CERT_TUR_MIN_BLOCKS = TUR_MIN_BLOCKS;
+const CERT_TUR_R_MIN = 1.0;
+const CERT_TUR_MIN_MEANQ = 1e-6;
+const OPK_DIFF_MAX = 0.25;
+const OPK_VIEW_MAX_CELLS = 65536;
+const OPK_PAYLOAD_EVERY_STEPS = 20000;
+const MAINT_EVERY_STEPS = 50000;
+const MAINT_TRIALS = 8;
+const MAINT_ERR_FRAC = 0.5;
+const MAINT_SERIES_CAP = 240;
+const SSTACK_STATS_EVERY_STEPS = 20000;
+const MOVE_P5_BASE = 7;
+const MOVE_P5_META = 8;
+const MOVE_CLOCK = 10;
+const DEFAULT_HISTORY_CAP = 400;
+const DEFAULT_STACK_MAX_LAYERS = 4;
 const META_ALIGN_SERIES_CAP = 400;
 const DEFAULT_PRESET_ID = "base_null_balanced";
 
-function pushHistory(series: number[], value: number) {
+function pushHistory(series: number[], value: number, cap: number) {
   series.push(value);
+  while (series.length > cap) series.shift();
+}
+
+function mean(values: number[]): number {
+  if (values.length === 0) return 0;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
+
+function variance(values: number[], meanValue: number): number {
+  if (values.length === 0) return 0;
+  let acc = 0;
+  for (const v of values) {
+    const d = v - meanValue;
+    acc += d * d;
+  }
+  return acc / values.length;
+}
+
+function formatTURValue(value: number): string {
+  if (!Number.isFinite(value)) return "inf";
+  const abs = Math.abs(value);
+  if (abs >= 1e4 || (abs > 0 && abs < 1e-3)) {
+    return value.toExponential(3);
+  }
+  return value.toFixed(3);
+}
+
+function parseOpOffsets(offsets: Int8Array): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i + 1 < offsets.length; i += 2) {
+    out.push([offsets[i] ?? 0, offsets[i + 1] ?? 0]);
+  }
+  return out;
+}
+
+function opkOffsetIndex(q: number, dx: number, dy: number, grid: number): number {
+  const x = q % grid;
+  const y = Math.floor(q / grid);
+  const nx = (x + dx + grid) % grid;
+  const ny = (y + dy + grid) % grid;
+  return ny * grid + nx;
+}
+
+function computeOpkBudgetBadCells(
+  tokens: Uint8Array,
+  interfaces: number,
+  cells: number,
+  rCount: number,
+  budgetK: number
+): number {
+  if (interfaces <= 0 || cells <= 0 || rCount <= 0) return 0;
+  let bad = 0;
+  for (let iface = 0; iface < interfaces; iface += 1) {
+    const ifaceOffset = iface * cells * rCount;
+    for (let q = 0; q < cells; q += 1) {
+      const start = ifaceOffset + q * rCount;
+      let sum = 0;
+      for (let r = 0; r < rCount; r += 1) sum += tokens[start + r] ?? 0;
+      if (sum !== budgetK) bad += 1;
+    }
+  }
+  return bad;
+}
+
+function computeOpkSdiffMean({
+  tokens,
+  offsets,
+  grid,
+  interfaces,
+  rCount,
+  budgetK,
+  baseS,
+  metaS,
+  lS,
+}: {
+  tokens: Uint8Array;
+  offsets: Array<[number, number]>;
+  grid: number;
+  interfaces: number;
+  rCount: number;
+  budgetK: number;
+  baseS: Uint8Array;
+  metaS: Uint8Array;
+  lS: number;
+}): number {
+  const cells = grid * grid;
+  if (cells === 0 || interfaces === 0 || rCount === 0) return 0;
+  const denom = Math.max(1, lS);
+  const budget = Math.max(1, budgetK);
+  let total = 0;
+  for (let iface = 0; iface < interfaces; iface += 1) {
+    let sdiffSum = 0;
+    const ifaceOffset = iface * cells;
+    const lowerOffset = iface === 0 ? -1 : (iface - 1) * cells;
+    for (let q = 0; q < cells; q += 1) {
+      const start = (ifaceOffset + q) * rCount;
+      let pred = 0;
+      for (let r = 0; r < rCount; r += 1) {
+        const k = (tokens[start + r] ?? 0) / budget;
+        const [dx, dy] = offsets[r] ?? [0, 0];
+        const qOff = opkOffsetIndex(q, dx, dy, grid);
+        const lower =
+          iface === 0 ? baseS[qOff] ?? 0 : metaS[lowerOffset + qOff] ?? 0;
+        pred += k * (lower / denom);
+      }
+      const upper = metaS[ifaceOffset + q] ?? 0;
+      sdiffSum += Math.abs(upper / denom - pred);
+    }
+    total += sdiffSum / cells;
+  }
+  return total / interfaces;
+}
+
+function buildOpkTokenMap(
+  tokens: Uint8Array,
+  interfaceIdx: number,
+  rIdx: number,
+  cells: number,
+  rCount: number
+): Uint8Array {
+  const out = new Uint8Array(cells);
+  const ifaceOffset = interfaceIdx * cells * rCount;
+  for (let q = 0; q < cells; q += 1) {
+    out[q] = tokens[ifaceOffset + q * rCount + rIdx] ?? 0;
+  }
+  return out;
+}
+
+function buildOpkTotalMap(
+  tokens: Uint8Array,
+  interfaceIdx: number,
+  cells: number,
+  rCount: number
+): Uint8Array {
+  const out = new Uint8Array(cells);
+  const ifaceOffset = interfaceIdx * cells * rCount;
+  for (let q = 0; q < cells; q += 1) {
+    const start = ifaceOffset + q * rCount;
+    let sum = 0;
+    for (let r = 0; r < rCount; r += 1) sum += tokens[start + r] ?? 0;
+    out[q] = Math.min(255, sum);
+  }
+  return out;
+}
+
+function buildOpkMismatchMap({
+  tokens,
+  offsets,
+  grid,
+  interfaceIdx,
+  rCount,
+  budgetK,
+  baseS,
+  metaS,
+  lS,
+  diffMax,
+}: {
+  tokens: Uint8Array;
+  offsets: Array<[number, number]>;
+  grid: number;
+  interfaceIdx: number;
+  rCount: number;
+  budgetK: number;
+  baseS: Uint8Array;
+  metaS: Uint8Array;
+  lS: number;
+  diffMax: number;
+}): Uint8Array {
+  const cells = grid * grid;
+  const out = new Uint8Array(cells);
+  if (cells === 0 || rCount === 0) return out;
+  const denom = Math.max(1, lS);
+  const budget = Math.max(1, budgetK);
+  const ifaceOffset = interfaceIdx * cells;
+  const lowerOffset = interfaceIdx === 0 ? -1 : (interfaceIdx - 1) * cells;
+  const scale = diffMax > 0 ? 255 / diffMax : 0;
+  for (let q = 0; q < cells; q += 1) {
+    const start = (ifaceOffset + q) * rCount;
+    let pred = 0;
+    for (let r = 0; r < rCount; r += 1) {
+      const k = (tokens[start + r] ?? 0) / budget;
+      const [dx, dy] = offsets[r] ?? [0, 0];
+      const qOff = opkOffsetIndex(q, dx, dy, grid);
+      const lower =
+        interfaceIdx === 0 ? baseS[qOff] ?? 0 : metaS[lowerOffset + qOff] ?? 0;
+      pred += k * (lower / denom);
+    }
+    const upper = metaS[ifaceOffset + q] ?? 0;
+    const diff = Math.abs(upper / denom - pred);
+    out[q] = Math.max(0, Math.min(255, Math.round(diff * scale)));
+  }
+  return out;
+}
+
+function quadrantIndex(idx: number, g: number): number {
+  const x = idx % g;
+  const y = Math.floor(idx / g);
+  const qx = x < g / 2 ? 0 : 1;
+  const qy = y < g / 2 ? 0 : 1;
+  return qy * 2 + qx;
+}
+
+function logicalBitsFromField(
+  field: Uint8Array,
+  g: number,
+  lS: number,
+  mask?: Uint8Array
+): number[] {
+  const sums = [0, 0, 0, 0];
+  const counts = [0, 0, 0, 0];
+  for (let i = 0; i < field.length; i += 1) {
+    if (mask && mask[i] === 0) continue;
+    const q = quadrantIndex(i, g);
+    sums[q] += field[i] ?? 0;
+    counts[q] += 1;
+  }
+  const threshold = lS / 2;
+  return sums.map((sum, i) => {
+    const meanVal = counts[i] > 0 ? sum / counts[i] : 0;
+    return meanVal >= threshold ? 1 : 0;
+  });
+}
+
+function errorRate(bitsA: number[], bitsB: number[]): number {
+  let mismatches = 0;
+  const len = Math.min(bitsA.length, bitsB.length);
+  if (len === 0) return 0;
+  for (let i = 0; i < len; i += 1) {
+    if (bitsA[i] !== bitsB[i]) mismatches += 1;
+  }
+  return mismatches / len;
+}
+
+function makeRng(seed: number) {
+  let x = seed >>> 0;
+  if (x === 0) x = 1;
+  return () => {
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    return (x >>> 8) / (1 << 24);
+  };
+}
+
+function computeErrF05(
+  baseS: Uint8Array,
+  meta0: Uint8Array,
+  grid: number,
+  lS: number,
+  trials: number,
+  frac: number,
+  seed: number
+): number {
+  if (baseS.length === 0 || meta0.length === 0 || grid <= 0 || trials <= 0) return 0;
+  const baseBits = logicalBitsFromField(baseS, grid, lS);
+  const rng = makeRng(seed);
+  let acc = 0;
+  const mask = new Uint8Array(meta0.length);
+  for (let t = 0; t < trials; t += 1) {
+    for (let i = 0; i < meta0.length; i += 1) {
+      mask[i] = rng() < frac ? 1 : 0;
+    }
+    const bits = logicalBitsFromField(meta0, grid, lS, mask);
+    acc += errorRate(bits, baseBits);
+  }
+  return acc / trials;
 }
 
 function drawSparkline(
@@ -807,6 +1096,7 @@ const DEFAULT_PARAMS: SimParams = {
   sCouplingMode: 0,
   opStencil: 0,
   opBudgetK: 8,
+  opKTargetWeight: 1.0,
   opDriveOnK: 0,
 };
 
@@ -818,6 +1108,10 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [graphStats, setGraphStats] = useState<GraphStats | null>(null);
   const [graphStatsN, setGraphStatsN] = useState<number | null>(null);
+  const [bondsMode, setBondsMode] = useState<"live" | "chart" | "off">("live");
+  const [graphStatsMode, setGraphStatsMode] = useState<"auto" | "ondemand" | "off">("auto");
+  const [stackMaxLayers, setStackMaxLayers] = useState(DEFAULT_STACK_MAX_LAYERS);
+  const [historyCap, setHistoryCap] = useState(DEFAULT_HISTORY_CAP);
   const [recordEverySteps, setRecordEverySteps] = useState(2000);
   const [totalSteps, setTotalSteps] = useState(0);
   const [epExactTotal, setEpExactTotal] = useState<number | null>(null);
@@ -825,9 +1119,49 @@ export default function App() {
   const [epExactRate, setEpExactRate] = useState<number | null>(null);
   const [epNaiveRate, setEpNaiveRate] = useState<number | null>(null);
   const [clockDebug, setClockDebug] = useState<null | { state: number; q: number; fwd: number; bwd: number }>(null);
+  const [turStats, setTurStats] = useState<null | {
+    blocks: number;
+    meanQ: number;
+    varQ: number;
+    meanSigma: number;
+    R: number;
+  }>(null);
+  const [opkMeta, setOpkMeta] = useState<null | {
+    enabled: boolean;
+    budgetK: number;
+    interfaces: number;
+    rCount: number;
+    stencilId: number;
+    computedAtSteps?: number;
+  }>(null);
+  const [opkStats, setOpkStats] = useState<null | {
+    sdiffMean: number;
+    budgetOk: boolean;
+    badCells: number;
+    budgetK: number;
+    interfaces: number;
+    rCount: number;
+    stencilId: number;
+  }>(null);
+  const [maintStats, setMaintStats] = useState<null | {
+    errF0_5: number | null;
+    sdiffBase: number | null;
+    epRepairRate: number | null;
+    epClockRate: number | null;
+    noiseExpectedEdits: number | null;
+    lastPerturbStep: number | null;
+    recoverySteps: number | null;
+  }>(null);
   const [sStackMode, setSStackMode] = useState<"layers" | "diff_base" | "diff_meta">("layers");
   const [sStackDiffIndex, setSStackDiffIndex] = useState(0);
   const [sStackMetaStart, setSStackMetaStart] = useState(0);
+  const [opkInterfaceIdx, setOpkInterfaceIdx] = useState(0);
+  const [opkOffsetIdx, setOpkOffsetIdx] = useState(0);
+  const [opkViewMode, setOpkViewMode] = useState<"tokens" | "total" | "mismatch">("tokens");
+  const [opkHistAll, setOpkHistAll] = useState(false);
+  const [opkPayloadVersion, setOpkPayloadVersion] = useState(0);
+  const [opkViewVersion, setOpkViewVersion] = useState(0);
+  const [opkViewStatus, setOpkViewStatus] = useState<"ok" | "waiting" | "mismatch">("waiting");
   const [layerSafeStats, setLayerSafeStats] = useState<
     Array<{ id: string; label: string; stats: SafeSetStats }>
   >([]);
@@ -844,7 +1178,15 @@ export default function App() {
     sdiffMeta: number;
     wdiffMeta: number;
   }>(null);
-  const [certPassed, setCertPassed] = useState({ epNull: false, sigmaNull: false, m6Null: false });
+  const [certPassed, setCertPassed] = useState({
+    epNull: false,
+    sigmaNull: false,
+    m6Null: false,
+    clockNull: false,
+    tur: false,
+    opkBudget: false,
+    codeMaint: false,
+  });
   const [p1Enabled, setP1Enabled] = useState(true);
   const [p2Enabled, setP2Enabled] = useState(true);
   const [p4Enabled, setP4Enabled] = useState(true);
@@ -870,6 +1212,9 @@ export default function App() {
     p2: false,
     p4: false,
     p5: false,
+    clock: false,
+    opk: false,
+    maintenance: false,
     p6: false,
     meta: false,
   });
@@ -879,11 +1224,64 @@ export default function App() {
   const histRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
   const sStackRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
   const metaAlignCanvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+  const bondsCacheRef = useRef<Uint32Array>(new Uint32Array());
+  const emptyBondsRef = useRef<Uint32Array>(new Uint32Array());
+  const graphStatsRef = useRef<GraphStats | null>(null);
+  const lastNRef = useRef<number>(n);
+  const lastBondsRefreshStepsRef = useRef<number | null>(null);
   const historyRef = useRef<History>({});
   const chartStepRef = useRef(0);
+  const sStackStatsStepRef = useRef(0);
   const epStepCounterRef = useRef(0);
   const epWindowRef = useRef<EpPoint[]>([]);
-  const certCountsRef = useRef({ epNull: 0, sigmaNull: 0, m6Null: 0 });
+  const certCountsRef = useRef({
+    epNull: 0,
+    sigmaNull: 0,
+    m6Null: 0,
+    clockNull: 0,
+    tur: 0,
+    opkBudget: 0,
+    codeMaint: 0,
+  });
+  const turRef = useRef({
+    lastStep: 0,
+    lastQ: 0,
+    lastSigma: 0,
+    samplesQ: [] as number[],
+    samplesSigma: [] as number[],
+  });
+  const opkCacheRef = useRef({
+    tokens: null as Uint8Array | null,
+    offsets: null as Int8Array | null,
+    offsetPairs: [] as Array<[number, number]>,
+  });
+  const opkMetaRef = useRef<typeof opkMeta>(null);
+  const opkFieldRef = useRef({
+    baseS: new Uint8Array(),
+    metaS: new Uint8Array(),
+    grid: 0,
+    lS: 1,
+    metaLayers: 0,
+  });
+  const opkStatsRef = useRef<typeof opkStats>(null);
+  const opkCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const opkHistCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const maintHistoryRef = useRef({
+    err: [] as number[],
+    sdiff: [] as number[],
+    repair: [] as number[],
+  });
+  const maintCanvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+  const maintRef = useRef({
+    lastStep: 0,
+    lastEpRepair: 0,
+    lastEpClock: 0,
+    lastPerturbStep: null as number | null,
+    baselineErr: null as number | null,
+    baselineSdiff: null as number | null,
+    recoverySteps: null as number | null,
+    seed: 1234567,
+  });
   const metaAlignHistoryRef = useRef({
     sdiffBase: [] as number[],
     sdiffMeta: [] as number[],
@@ -905,11 +1303,20 @@ export default function App() {
   const metaLayerCount = metaSnapshot?.layers ?? 0;
   const selectedPreset =
     PRESET_CATALOG.find((entry) => entry.id === presetId) ?? PRESET_CATALOG[0] ?? null;
+  const resolveBondsEverySteps = (
+    mode: "live" | "chart" | "off" = bondsMode,
+    steps = recordEverySteps
+  ) => {
+    if (mode === "off") return 0;
+    if (mode === "live") return 1;
+    return Math.max(1, Math.floor(steps));
+  };
+  const bondsEverySteps = resolveBondsEverySteps();
 
   // Use module-level singleton to avoid React StrictMode double-creation
   const client = getClient();
 
-  const applyPreset = (entry: PresetEntry, sendConfig = true) => {
+  const applyPreset = (entry: PresetEntry) => {
     const nextDraft: SimParams = { ...DEFAULT_PARAMS, ...entry.params };
     const nextP1 = (nextDraft.pWrite ?? 0) > 0;
     const nextP2 = (nextDraft.pAWrite ?? 0) > 0;
@@ -936,9 +1343,6 @@ export default function App() {
       pSWrite: nextP5 ? nextDraft.pSWrite : 0,
     };
     setParamsApplied(nextApplied);
-    if (sendConfig && status !== "idle" && status !== "initializing") {
-      client.send({ type: "config", bondThreshold, params: nextApplied });
-    }
   };
 
   const presetInitRef = useRef(false);
@@ -946,7 +1350,7 @@ export default function App() {
     if (presetInitRef.current) return;
     presetInitRef.current = true;
     if (selectedPreset) {
-      applyPreset(selectedPreset, false);
+      applyPreset(selectedPreset);
     }
   }, [selectedPreset]);
 
@@ -958,6 +1362,15 @@ export default function App() {
     const offErr = client.onError((m) => setError(m));
     const offSnap = client.onSnapshot((s) => {
       let currentEpExactRate: number | null = null;
+      let turStatsNow: typeof turStats = null;
+      let opkMetaNow: typeof opkMeta = null;
+      let epExactByMoveNow: Float64Array | null = null;
+      let codeMaintPassNow: boolean | null = null;
+      let epExactTotalNow: number | null = null;
+      let stepNow: number | null = null;
+      let clockQ: number | null = null;
+      let clockFwd: number | null = null;
+      let clockBwd: number | null = null;
       const canvas = canvasRef.current;
       if (!canvas) return;
       const overlay =
@@ -989,37 +1402,63 @@ export default function App() {
         overlayField = metaWEdgesToCells(slice, grid);
         overlayMax = paramsApplied.lW;
       }
+      lastNRef.current = s.n;
+      const bondsReceived = s.bonds.length > 0;
+      if (bondsReceived) {
+        bondsCacheRef.current = s.bonds;
+      }
+      const bondsForDraw =
+        bondsMode === "off"
+          ? emptyBondsRef.current
+          : s.bonds.length > 0
+          ? s.bonds
+          : bondsCacheRef.current;
       drawFrame(
         canvas,
         s.positions,
-        s.bonds,
+        bondsForDraw,
         overlay,
         overlayField,
         overlayMax
       );
       setEnergy(s.energy);
       setDiagnostics(s.diagnostics);
-      const stats = computeGraphStats(s.n, s.bonds);
-      setGraphStats(stats);
-      setGraphStatsN(s.n);
-      const safeSet = computeSafeSetStats(s.baseSField, safeThreshold);
+      let stats: GraphStats | null = graphStatsMode === "off" ? null : graphStatsRef.current;
+      if (graphStatsMode === "auto" && s.bonds.length > 0) {
+        stats = computeGraphStats(s.n, s.bonds);
+        graphStatsRef.current = stats;
+        setGraphStats(stats);
+        setGraphStatsN(s.n);
+      }
       setMetaSnapshot({ layers: s.metaLayers, length: s.metaField.length });
+      opkFieldRef.current = {
+        baseS: s.baseSField,
+        metaS: s.metaField,
+        grid: paramsApplied.gridSize,
+        lS: paramsApplied.lS,
+        metaLayers: s.metaLayers,
+      };
       if (s.steps > 0) {
         setTotalSteps((prev) => prev + s.steps);
       }
       const epExtras = s.extras?.ep;
       if (epExtras && typeof epExtras.exactTotal === "number") {
+        epExactTotalNow = epExtras.exactTotal;
         setEpExactTotal(epExtras.exactTotal);
         setEpNaiveTotal(typeof epExtras.naiveTotal === "number" ? epExtras.naiveTotal : null);
       }
-      if (s.steps > 0 && epExtras && typeof epExtras.exactTotal === "number") {
+      if (epExtras?.exactByMove instanceof Float64Array) {
+        epExactByMoveNow = epExtras.exactByMove;
+      }
+      if (s.steps > 0 && epExactTotalNow !== null) {
         epStepCounterRef.current += s.steps;
-        const stepNow = epStepCounterRef.current;
+        stepNow = epStepCounterRef.current;
+        const epNaiveTotalNow = typeof epExtras?.naiveTotal === "number" ? epExtras.naiveTotal : 0;
         const points = epWindowRef.current;
         points.push({
           step: stepNow,
-          exact: epExtras.exactTotal,
-          naive: typeof epExtras.naiveTotal === "number" ? epExtras.naiveTotal : 0,
+          exact: epExactTotalNow,
+          naive: epNaiveTotalNow,
         });
         while (points.length > 0 && stepNow - points[0]!.step > EP_WINDOW_STEPS) {
           points.shift();
@@ -1031,7 +1470,7 @@ export default function App() {
           const dt = stepNow - oldest.step;
           if (dt > 0) {
             exactRate = (epExtras.exactTotal - oldest.exact) / dt;
-            if (typeof epExtras.naiveTotal === "number") {
+            if (typeof epExtras?.naiveTotal === "number") {
               naiveRate = (epExtras.naiveTotal - oldest.naive) / dt;
             }
           }
@@ -1039,6 +1478,11 @@ export default function App() {
         currentEpExactRate = exactRate;
         setEpExactRate(exactRate);
         setEpNaiveRate(naiveRate);
+      }
+
+      if (bondsReceived) {
+        const stepMark = stepNow !== null ? stepNow : epStepCounterRef.current;
+        lastBondsRefreshStepsRef.current = stepMark;
       }
 
       const clockExtras = s.extras?.clock;
@@ -1049,14 +1493,102 @@ export default function App() {
         Number.isFinite(clockExtras.fwd) &&
         Number.isFinite(clockExtras.bwd)
       ) {
+        clockQ = Number(clockExtras.q);
+        clockFwd = Number(clockExtras.fwd);
+        clockBwd = Number(clockExtras.bwd);
         setClockDebug({
           state: Number(clockExtras.state),
-          q: Number(clockExtras.q),
-          fwd: Number(clockExtras.fwd),
-          bwd: Number(clockExtras.bwd),
+          q: clockQ,
+          fwd: clockFwd,
+          bwd: clockBwd,
         });
       } else {
         setClockDebug(null);
+      }
+
+      const opkExtras = s.extras?.opk;
+      if (opkExtras) {
+        const meta = {
+          enabled: opkExtras.enabled ?? false,
+          budgetK: opkExtras.budgetK ?? paramsApplied.opBudgetK,
+          interfaces: opkExtras.interfaces ?? paramsApplied.metaLayers,
+          rCount: opkExtras.rCount ?? 0,
+          stencilId: opkExtras.stencilId ?? 0,
+          computedAtSteps: opkExtras.computedAtSteps,
+        };
+        opkMetaNow = meta;
+        const prevMeta = opkMetaRef.current;
+        const metaChanged =
+          !prevMeta ||
+          prevMeta.enabled !== meta.enabled ||
+          prevMeta.budgetK !== meta.budgetK ||
+          prevMeta.interfaces !== meta.interfaces ||
+          prevMeta.rCount !== meta.rCount ||
+          prevMeta.stencilId !== meta.stencilId ||
+          prevMeta.computedAtSteps !== meta.computedAtSteps;
+        if (metaChanged) {
+          opkMetaRef.current = meta;
+          setOpkMeta(meta);
+        }
+        const cache = opkCacheRef.current;
+        if (opkExtras.offsets && opkExtras.offsets.length > 0) {
+          cache.offsets = opkExtras.offsets;
+          cache.offsetPairs = parseOpOffsets(opkExtras.offsets);
+        }
+        if (opkExtras.tokens && opkExtras.tokens.length > 0) {
+          cache.tokens = opkExtras.tokens;
+        }
+        if (
+          opkExtras.tokens &&
+          opkExtras.tokens.length > 0 &&
+          opkExtras.offsets &&
+          opkExtras.offsets.length > 0
+        ) {
+          setOpkPayloadVersion((v) => v + 1);
+        }
+        if (!meta.enabled) {
+          opkStatsRef.current = null;
+          setOpkStats(null);
+        }
+      }
+
+      if (stepNow !== null && clockQ !== null && epExactTotalNow !== null) {
+        const ref = turRef.current;
+        if (ref.lastStep === 0) {
+          ref.lastStep = stepNow;
+          ref.lastQ = clockQ;
+          ref.lastSigma = epExactTotalNow;
+        } else if (stepNow - ref.lastStep >= TUR_BLOCK_STEPS) {
+          const dq = clockQ - ref.lastQ;
+          const ds = epExactTotalNow - ref.lastSigma;
+          ref.samplesQ.push(dq);
+          ref.samplesSigma.push(ds);
+          ref.lastStep = stepNow;
+          ref.lastQ = clockQ;
+          ref.lastSigma = epExactTotalNow;
+          while (ref.samplesQ.length > TUR_SAMPLES_CAP) ref.samplesQ.shift();
+          while (ref.samplesSigma.length > TUR_SAMPLES_CAP) ref.samplesSigma.shift();
+        }
+      }
+
+      const turSamplesQ = turRef.current.samplesQ;
+      const turSamplesSigma = turRef.current.samplesSigma;
+      if (turSamplesQ.length >= 2 && turSamplesQ.length === turSamplesSigma.length) {
+        const meanQ = mean(turSamplesQ);
+        const varQ = variance(turSamplesQ, meanQ);
+        const meanSigma = mean(turSamplesSigma);
+        const R = meanQ !== 0 ? (varQ / (meanQ * meanQ)) * (meanSigma / 2) : Infinity;
+        turStatsNow = {
+          blocks: turSamplesQ.length,
+          meanQ,
+          varQ,
+          meanSigma,
+          R,
+        };
+        setTurStats(turStatsNow);
+      } else {
+        turStatsNow = null;
+        setTurStats(null);
       }
 
       if (
@@ -1091,8 +1623,16 @@ export default function App() {
         }
       }
 
+      sStackStatsStepRef.current += Math.max(0, s.steps);
+      let shouldUpdateSStackStats = false;
+      if (sStackStatsStepRef.current >= SSTACK_STATS_EVERY_STEPS) {
+        sStackStatsStepRef.current =
+          sStackStatsStepRef.current % SSTACK_STATS_EVERY_STEPS;
+        shouldUpdateSStackStats = true;
+      }
+
       if (s.metaLayers > 0 && cells > 0) {
-        const maxMetaPanels = Math.max(0, MAX_STACK_LAYERS - 1);
+        const maxMetaPanels = Math.max(0, stackMaxLayers - 1);
         const start = Math.max(0, Math.min(sStackMetaStart, Math.max(0, s.metaLayers - 1)));
         const metaCount = Math.min(s.metaLayers - start, maxMetaPanels);
         const baseField = s.baseSField;
@@ -1101,16 +1641,23 @@ export default function App() {
           if (s.metaField.length < offset + cells) return null;
           return s.metaField.subarray(offset, offset + cells);
         };
-        const statsList: Array<{ id: string; label: string; stats: SafeSetStats }> = [];
-        const addStats = (id: string, label: string, field: Uint8Array) => {
-          statsList.push({ id, label, stats: computeSafeSetStats(field, safeThreshold) });
-        };
+        const statsList: Array<{ id: string; label: string; stats: SafeSetStats }> | null =
+          shouldUpdateSStackStats ? [] : null;
+        const addStats = statsList
+          ? (id: string, label: string, field: Uint8Array) => {
+              statsList.push({ id, label, stats: computeSafeSetStats(field, safeThreshold) });
+            }
+          : null;
+        let nextDiffMean: number | null = sStackDiffMean;
         if (sStackMode === "layers") {
           const baseCanvas = sStackRefs.current["sstack_base"];
           if (baseCanvas) {
             drawFieldHeatmap(baseCanvas, baseField, grid, paramsApplied.lS);
           }
-          addStats("sstack_base", "Base", baseField);
+          if (addStats) addStats("sstack_base", "Base", baseField);
+          if (shouldUpdateSStackStats) {
+            nextDiffMean = null;
+          }
           for (let i = 0; i < metaCount; i++) {
             const layerIndex = start + i;
             const metaField = getMeta(layerIndex);
@@ -1120,10 +1667,7 @@ export default function App() {
             if (canvas) {
               drawFieldHeatmap(canvas, metaField, grid, paramsApplied.lS);
             }
-            addStats(id, `Meta ${layerIndex}`, metaField);
-          }
-          if (sStackDiffMean !== null) {
-            setSStackDiffMean(null);
+            if (addStats) addStats(id, `Meta ${layerIndex}`, metaField);
           }
         } else if (sStackMode === "diff_base") {
           const meta0 = getMeta(0);
@@ -1131,20 +1675,22 @@ export default function App() {
           if (baseCanvas) {
             drawFieldHeatmap(baseCanvas, baseField, grid, paramsApplied.lS);
           }
-          addStats("sstack_base", "Base", baseField);
+          if (addStats) addStats("sstack_base", "Base", baseField);
           if (meta0) {
             const metaCanvas = sStackRefs.current["sstack_meta_0"];
             if (metaCanvas) {
               drawFieldHeatmap(metaCanvas, meta0, grid, paramsApplied.lS);
             }
-            addStats("sstack_meta_0", "Meta 0", meta0);
+            if (addStats) addStats("sstack_meta_0", "Meta 0", meta0);
             const diffCanvas = sStackRefs.current["sstack_diff_base0"];
             if (diffCanvas) {
               drawFieldAbsDiffHeatmap(diffCanvas, baseField, meta0, grid, paramsApplied.lS);
             }
-            setSStackDiffMean(meanAbsDiff(baseField, meta0, cells));
-          } else if (sStackDiffMean !== null) {
-            setSStackDiffMean(null);
+            if (shouldUpdateSStackStats) {
+              nextDiffMean = meanAbsDiff(baseField, meta0, cells);
+            }
+          } else if (shouldUpdateSStackStats) {
+            nextDiffMean = null;
           }
         } else if (sStackMode === "diff_meta" && s.metaLayers >= 2) {
           const maxPair = Math.max(0, s.metaLayers - 2);
@@ -1156,44 +1702,149 @@ export default function App() {
             if (canvasA) {
               drawFieldHeatmap(canvasA, metaA, grid, paramsApplied.lS);
             }
-            addStats(`sstack_meta_${k}`, `Meta ${k}`, metaA);
+            if (addStats) addStats(`sstack_meta_${k}`, `Meta ${k}`, metaA);
           }
           if (metaB) {
             const canvasB = sStackRefs.current[`sstack_meta_${k + 1}`];
             if (canvasB) {
               drawFieldHeatmap(canvasB, metaB, grid, paramsApplied.lS);
             }
-            addStats(`sstack_meta_${k + 1}`, `Meta ${k + 1}`, metaB);
+            if (addStats) addStats(`sstack_meta_${k + 1}`, `Meta ${k + 1}`, metaB);
           }
           if (metaA && metaB) {
             const diffCanvas = sStackRefs.current["sstack_diff_meta_pair"];
             if (diffCanvas) {
               drawFieldAbsDiffHeatmap(diffCanvas, metaA, metaB, grid, paramsApplied.lS);
             }
-            setSStackDiffMean(meanAbsDiff(metaA, metaB, cells));
-          } else if (sStackDiffMean !== null) {
-            setSStackDiffMean(null);
+            if (shouldUpdateSStackStats) {
+              nextDiffMean = meanAbsDiff(metaA, metaB, cells);
+            }
+          } else if (shouldUpdateSStackStats) {
+            nextDiffMean = null;
           }
         }
-        setLayerSafeStats(statsList);
+        if (statsList) {
+          setLayerSafeStats(statsList);
+        }
+        if (shouldUpdateSStackStats) {
+          setSStackDiffMean(nextDiffMean ?? null);
+        }
       } else if (layerSafeStats.length > 0 || sStackDiffMean !== null) {
         setLayerSafeStats([]);
         setSStackDiffMean(null);
       }
 
-      const isNullConfig = !p3Enabled && !p6Enabled;
-      if (!isNullConfig) {
-        certCountsRef.current = { epNull: 0, sigmaNull: 0, m6Null: 0 };
-        if (certPassed.epNull || certPassed.sigmaNull || certPassed.m6Null) {
-          setCertPassed({ epNull: false, sigmaNull: false, m6Null: false });
+      const maintStepNow = epStepCounterRef.current;
+      if (
+        maintStepNow > 0 &&
+        epExactByMoveNow &&
+        maintStepNow - maintRef.current.lastStep >= MAINT_EVERY_STEPS
+      ) {
+        const maint = maintRef.current;
+        const windowSteps = maintStepNow - maint.lastStep;
+        const epRepairTotal =
+          (epExactByMoveNow[MOVE_P5_BASE] ?? 0) + (epExactByMoveNow[MOVE_P5_META] ?? 0);
+        const epClockTotal = epExactByMoveNow[MOVE_CLOCK] ?? 0;
+        const epRepairRate =
+          maint.lastStep > 0 && windowSteps > 0 ? (epRepairTotal - maint.lastEpRepair) / windowSteps : null;
+        const epClockRate =
+          maint.lastStep > 0 && windowSteps > 0 ? (epClockTotal - maint.lastEpClock) / windowSteps : null;
+        const noiseExpectedEdits =
+          paramsApplied.codeNoiseRate *
+          windowSteps *
+          Math.max(1, Math.floor(paramsApplied.codeNoiseBatch || 1));
+
+        let sdiffBase: number | null = null;
+        let errF0_5: number | null = null;
+        if (paramsApplied.metaLayers >= 1 && cells > 0 && s.metaField.length >= cells) {
+          const meta0 = s.metaField.subarray(0, cells);
+          sdiffBase = meanAbsDiff(s.baseSField, meta0, cells);
+          errF0_5 = computeErrF05(
+            s.baseSField,
+            meta0,
+            grid,
+            paramsApplied.lS,
+            MAINT_TRIALS,
+            MAINT_ERR_FRAC,
+            maint.seed++
+          );
         }
-      } else {
-        const warmedUp = epStepCounterRef.current >= CERT_MIN_STEPS;
-        const updateStable = (key: "epNull" | "sigmaNull" | "m6Null", passNow: boolean) => {
-          const counts = certCountsRef.current;
-          counts[key] = passNow ? counts[key] + 1 : 0;
-          return counts[key] >= CERT_STABILITY_K;
+
+        let recoverySteps = maint.recoverySteps;
+        if (maint.lastPerturbStep !== null && recoverySteps === null) {
+          const errOk =
+            errF0_5 !== null &&
+            maint.baselineErr !== null &&
+            errF0_5 <= maint.baselineErr * 1.1;
+          const sdiffOk =
+            sdiffBase !== null &&
+            maint.baselineSdiff !== null &&
+            sdiffBase <= maint.baselineSdiff * 1.1;
+          if ((errOk || sdiffOk) && maintStepNow >= maint.lastPerturbStep) {
+            recoverySteps = maintStepNow - maint.lastPerturbStep;
+          }
+        }
+
+        maint.lastStep = maintStepNow;
+        maint.lastEpRepair = epRepairTotal;
+        maint.lastEpClock = epClockTotal;
+        maint.recoverySteps = recoverySteps;
+
+        const nextMaint = {
+          errF0_5,
+          sdiffBase,
+          epRepairRate,
+          epClockRate,
+          noiseExpectedEdits,
+          lastPerturbStep: maint.lastPerturbStep,
+          recoverySteps,
         };
+        setMaintStats(nextMaint);
+
+        const histories = maintHistoryRef.current;
+        if (errF0_5 !== null && Number.isFinite(errF0_5)) {
+          histories.err.push(errF0_5);
+          if (histories.err.length > MAINT_SERIES_CAP) histories.err.shift();
+          const canvas = maintCanvasRefs.current["maint_err"];
+          if (canvas) drawSparkline(canvas, histories.err, "rgba(255, 180, 140, 0.85)");
+        }
+        if (sdiffBase !== null && Number.isFinite(sdiffBase)) {
+          histories.sdiff.push(sdiffBase);
+          if (histories.sdiff.length > MAINT_SERIES_CAP) histories.sdiff.shift();
+          const canvas = maintCanvasRefs.current["maint_sdiff"];
+          if (canvas) drawSparkline(canvas, histories.sdiff, "rgba(160, 220, 140, 0.85)");
+        }
+        if (epRepairRate !== null && Number.isFinite(epRepairRate)) {
+          histories.repair.push(epRepairRate);
+          if (histories.repair.length > MAINT_SERIES_CAP) histories.repair.shift();
+          const canvas = maintCanvasRefs.current["maint_repair"];
+          if (canvas) drawSparkline(canvas, histories.repair, "rgba(140, 200, 255, 0.85)");
+        }
+
+        const warmMaint = epStepCounterRef.current >= 200000;
+        if (warmMaint) {
+          const errOk = errF0_5 !== null && errF0_5 <= 0.1;
+          const sdiffOk = sdiffBase !== null && sdiffBase <= 2.0;
+          const epOk = currentEpExactRate !== null && currentEpExactRate >= 1e-3;
+          codeMaintPassNow = errOk && sdiffOk && epOk;
+        } else {
+          codeMaintPassNow = false;
+        }
+      }
+
+      const isNullConfig = !p3Enabled && !p6Enabled;
+      const warmedUp = epStepCounterRef.current >= CERT_MIN_STEPS;
+      const counts = certCountsRef.current;
+      const updateStable = (
+        key: "epNull" | "sigmaNull" | "m6Null" | "clockNull" | "tur" | "opkBudget" | "codeMaint",
+        passNow: boolean
+      ) => {
+        counts[key] = passNow ? counts[key] + 1 : 0;
+        return counts[key] >= CERT_STABILITY_K;
+      };
+
+      const next = { ...certPassed };
+      if (isNullConfig) {
         const epPassNow =
           warmedUp &&
           currentEpExactRate !== null &&
@@ -1207,35 +1858,101 @@ export default function App() {
           Math.abs(s.diagnostics.aM6S),
         );
         const m6PassNow = warmedUp && m6Max <= CERT_M6_ABS_MAX;
+        next.epNull = updateStable("epNull", epPassNow);
+        next.sigmaNull = updateStable("sigmaNull", sigmaPassNow);
+        next.m6Null = updateStable("m6Null", m6PassNow);
+      } else {
+        counts.epNull = 0;
+        counts.sigmaNull = 0;
+        counts.m6Null = 0;
+        next.epNull = false;
+        next.sigmaNull = false;
+        next.m6Null = false;
+      }
 
-        const next = {
-          epNull: updateStable("epNull", epPassNow),
-          sigmaNull: updateStable("sigmaNull", sigmaPassNow),
-          m6Null: updateStable("m6Null", m6PassNow),
-        };
-        if (
-          next.epNull !== certPassed.epNull ||
-          next.sigmaNull !== certPassed.sigmaNull ||
-          next.m6Null !== certPassed.m6Null
-        ) {
-          setCertPassed(next);
+      const clockNullGate = paramsApplied.clockOn >= 0.5 && isNullConfig;
+      if (clockNullGate) {
+        const stepsTotal = epStepCounterRef.current;
+        const clockDriftNow = clockQ !== null && stepsTotal > 0 ? clockQ / stepsTotal : null;
+        const clockPassNow =
+          stepsTotal >= CERT_CLOCK_NULL_MIN_STEPS &&
+          clockDriftNow !== null &&
+          Math.abs(clockDriftNow) <= CERT_CLOCK_NULL_DRIFT_ABS_MAX;
+        next.clockNull = updateStable("clockNull", clockPassNow);
+      } else {
+        counts.clockNull = 0;
+        next.clockNull = false;
+      }
+
+      const turGate = paramsApplied.clockOn >= 0.5 && p6Enabled;
+      if (turGate) {
+        const turPassNow =
+          turStatsNow !== null &&
+          turStatsNow.blocks >= CERT_TUR_MIN_BLOCKS &&
+          Math.abs(turStatsNow.meanQ) >= CERT_TUR_MIN_MEANQ &&
+          turStatsNow.R >= CERT_TUR_R_MIN;
+        next.tur = updateStable("tur", turPassNow);
+      } else {
+        counts.tur = 0;
+        next.tur = false;
+      }
+
+      const opkGate = paramsApplied.opCouplingOn >= 0.5 && paramsApplied.metaLayers >= 1;
+      if (opkGate) {
+        const opkCurrent = opkStatsRef.current;
+        const opkPassNow = opkCurrent !== null && opkCurrent.budgetOk;
+        next.opkBudget = updateStable("opkBudget", opkPassNow);
+      } else {
+        counts.opkBudget = 0;
+        next.opkBudget = false;
+      }
+
+      const codeMaintGate = paramsApplied.metaLayers >= 2 && p6Enabled;
+      if (codeMaintGate) {
+        if (codeMaintPassNow !== null) {
+          next.codeMaint = updateStable("codeMaint", codeMaintPassNow);
+        } else {
+          next.codeMaint = certPassed.codeMaint;
         }
+      } else {
+        counts.codeMaint = 0;
+        next.codeMaint = false;
+      }
+
+      if (
+        next.epNull !== certPassed.epNull ||
+        next.sigmaNull !== certPassed.sigmaNull ||
+        next.m6Null !== certPassed.m6Null ||
+        next.clockNull !== certPassed.clockNull ||
+        next.tur !== certPassed.tur ||
+        next.opkBudget !== certPassed.opkBudget ||
+        next.codeMaint !== certPassed.codeMaint
+      ) {
+        setCertPassed(next);
       }
 
       chartStepRef.current += Math.max(0, s.steps);
       if (chartStepRef.current >= recordEverySteps) {
         chartStepRef.current = chartStepRef.current % recordEverySteps;
+        const statsForCharts: GraphStats =
+          stats ?? ({
+            edges: 0,
+            components: 0,
+            largest: 0,
+            sizes: [],
+          });
+        const safeSet = computeSafeSetStats(s.baseSField, safeThreshold);
         const ctx: ChartContext = {
           diagnostics: s.diagnostics,
           energy: s.energy,
-          stats,
+          stats: statsForCharts,
           safeSet,
           n: s.n,
         };
         const history = historyRef.current;
         for (const chart of CHARTS) {
           const series = history[chart.id] ?? (history[chart.id] = []);
-          pushHistory(series, chart.value(ctx));
+          pushHistory(series, chart.value(ctx), historyCap);
           const chartCanvas = chartRefs.current[chart.id];
           if (chartCanvas) {
             drawSparkline(chartCanvas, series, chart.color, {
@@ -1249,6 +1966,72 @@ export default function App() {
           if (histCanvas) {
             drawHistogram(histCanvas, bins, hist.color);
           }
+        }
+
+        const opkCache = opkCacheRef.current;
+        const opkMetaCurrent = opkMetaNow ?? opkMeta;
+        if (
+          paramsApplied.opCouplingOn >= 0.5 &&
+          opkCache.tokens &&
+          opkCache.offsets &&
+          opkMetaCurrent
+        ) {
+          const grid = paramsApplied.gridSize;
+          const cells = grid * grid;
+          const { budgetK, interfaces, rCount, stencilId } = opkMetaCurrent;
+          const minTokens = interfaces * cells * rCount;
+          const minOffsets = rCount * 2;
+          const baseLen = opkFieldRef.current.baseS.length;
+          const metaLen = opkFieldRef.current.metaS.length;
+          const shapeOk =
+            cells > 0 &&
+            rCount > 0 &&
+            interfaces > 0 &&
+            opkCache.tokens.length >= minTokens &&
+            opkCache.offsets.length >= minOffsets &&
+            baseLen >= cells &&
+            metaLen >= interfaces * cells;
+          if (shapeOk) {
+            if (opkCache.offsetPairs.length !== rCount) {
+              opkCache.offsetPairs = parseOpOffsets(opkCache.offsets);
+            }
+            const badCells = computeOpkBudgetBadCells(
+              opkCache.tokens,
+              interfaces,
+              cells,
+              rCount,
+              budgetK
+            );
+            const sdiffMean = computeOpkSdiffMean({
+              tokens: opkCache.tokens,
+              offsets: opkCache.offsetPairs,
+              grid,
+              interfaces,
+              rCount,
+              budgetK,
+              baseS: opkFieldRef.current.baseS,
+              metaS: opkFieldRef.current.metaS,
+              lS: opkFieldRef.current.lS,
+            });
+            const nextStats = {
+              sdiffMean,
+              budgetOk: badCells === 0,
+              badCells,
+              budgetK,
+              interfaces,
+              rCount,
+              stencilId,
+            };
+            opkStatsRef.current = nextStats;
+            setOpkStats(nextStats);
+            setOpkViewVersion((v) => v + 1);
+          } else {
+            opkStatsRef.current = null;
+            setOpkStats(null);
+          }
+        } else if (opkStatsRef.current !== null) {
+          opkStatsRef.current = null;
+          setOpkStats(null);
         }
 
         const align = metaAlignRef.current;
@@ -1276,7 +2059,40 @@ export default function App() {
         }
       }
 
+      const edges = 2 * cells;
+      const metaS0 = s.metaLayers >= 1 ? s.metaField.subarray(0, cells) : null;
+      const metaS1 = s.metaLayers >= 2 ? s.metaField.subarray(cells, 2 * cells) : null;
+      const metaW0 = s.metaWEdges.length >= edges ? s.metaWEdges.subarray(0, edges) : null;
+      const metaW1 = s.metaWEdges.length >= 2 * edges ? s.metaWEdges.subarray(edges, 2 * edges) : null;
+      const epExtrasSummary = s.extras?.ep
+        ? {
+            exactTotal: s.extras.ep.exactTotal,
+            naiveTotal: s.extras.ep.naiveTotal,
+            exactByMove: s.extras.ep.exactByMove,
+          }
+        : undefined;
+      const clockExtrasSummary = s.extras?.clock
+        ? {
+            q: s.extras.clock.q,
+            fwd: s.extras.clock.fwd,
+            bwd: s.extras.clock.bwd,
+            state: s.extras.clock.state,
+          }
+        : undefined;
+      const opkExtrasSummary = s.extras?.opk
+        ? {
+            enabled: s.extras.opk.enabled,
+            budgetK: s.extras.opk.budgetK,
+            interfaces: s.extras.opk.interfaces,
+            rCount: s.extras.opk.rCount,
+            stencilId: s.extras.opk.stencilId,
+            computedAtSteps: s.extras.opk.computedAtSteps,
+          }
+        : undefined;
+
       addSnapshot({
+        snapshotVersion: s.snapshotVersion,
+        totalSteps: epStepCounterRef.current,
         n: s.n,
         energy: s.energy,
         diagnostics: s.diagnostics,
@@ -1285,7 +2101,25 @@ export default function App() {
         bonds: s.bonds,
         counters: s.counters,
         apparatus: s.apparatus,
-        field: s.baseSField,
+        baseSField: s.baseSField,
+        metaLayers: s.metaLayers,
+        metaS0,
+        metaS1,
+        metaW0,
+        metaW1,
+        extras: {
+          ep: epExtrasSummary,
+          clock: clockExtrasSummary,
+          opk: opkExtrasSummary,
+        },
+        metrics: {
+          epExactRateWindow: currentEpExactRate,
+          certPassed: { ...certPassed },
+          metaAlign: metaAlignRef.current ? { ...metaAlignRef.current } : null,
+          turStats: turStatsNow ? { ...turStatsNow } : turStats ? { ...turStats } : null,
+          opkStats: opkStatsRef.current ? { ...opkStatsRef.current } : null,
+          maintenance: maintStats ? { ...maintStats } : null,
+        },
         stepsDelta: s.steps,
       });
     });
@@ -1301,38 +2135,92 @@ export default function App() {
     overlayChannel,
     overlayLayerIndex,
     paramsApplied,
+    bondsMode,
+    graphStatsMode,
     recordEverySteps,
+    historyCap,
     safeThreshold,
     sStackMode,
     sStackDiffIndex,
     sStackMetaStart,
+    stackMaxLayers,
     p3Enabled,
     p6Enabled,
     certPassed.epNull,
     certPassed.sigmaNull,
     certPassed.m6Null,
+    certPassed.clockNull,
+    certPassed.tur,
+    certPassed.opkBudget,
+    certPassed.codeMaint,
   ]);
 
   useEffect(() => {
     if (status === "initializing") {
       historyRef.current = {};
       chartStepRef.current = 0;
+      sStackStatsStepRef.current = 0;
       epStepCounterRef.current = 0;
       epWindowRef.current = [];
-      certCountsRef.current = { epNull: 0, sigmaNull: 0, m6Null: 0 };
+      bondsCacheRef.current = new Uint32Array();
+      graphStatsRef.current = null;
+      lastNRef.current = n;
+      lastBondsRefreshStepsRef.current = null;
+      certCountsRef.current = {
+        epNull: 0,
+        sigmaNull: 0,
+        m6Null: 0,
+        clockNull: 0,
+        tur: 0,
+        opkBudget: 0,
+        codeMaint: 0,
+      };
+      maintHistoryRef.current = { err: [], sdiff: [], repair: [] };
+      maintRef.current = {
+        lastStep: 0,
+        lastEpRepair: 0,
+        lastEpClock: 0,
+        lastPerturbStep: null,
+        baselineErr: null,
+        baselineSdiff: null,
+        recoverySteps: null,
+        seed: 1234567,
+      };
       metaAlignHistoryRef.current = { sdiffBase: [], sdiffMeta: [], wdiffMeta: [] };
       metaAlignRef.current = null;
+      turRef.current = { lastStep: 0, lastQ: 0, lastSigma: 0, samplesQ: [], samplesSigma: [] };
+      opkCacheRef.current = { tokens: null, offsets: null, offsetPairs: [] };
+      opkMetaRef.current = null;
+      opkFieldRef.current = { baseS: new Uint8Array(), metaS: new Uint8Array(), grid: 0, lS: 1, metaLayers: 0 };
+      opkStatsRef.current = null;
+      setGraphStats(null);
+      setGraphStatsN(null);
       setTotalSteps(0);
       setEpExactTotal(null);
       setEpNaiveTotal(null);
       setEpExactRate(null);
       setEpNaiveRate(null);
       setClockDebug(null);
+      setTurStats(null);
+      setOpkMeta(null);
+      setOpkStats(null);
+      setOpkPayloadVersion(0);
+      setOpkViewVersion(0);
+      setOpkViewStatus("waiting");
+      setMaintStats(null);
       setLayerSafeStats([]);
       setSStackDiffMean(null);
       setMetaAlign(null);
       setMetaAlignBaseline(null);
-      setCertPassed({ epNull: false, sigmaNull: false, m6Null: false });
+      setCertPassed({
+        epNull: false,
+        sigmaNull: false,
+        m6Null: false,
+        clockNull: false,
+        tur: false,
+        opkBudget: false,
+        codeMaint: false,
+      });
     }
   }, [status]);
 
@@ -1349,8 +2237,35 @@ export default function App() {
 
   useEffect(() => {
     if (status === "idle" || status === "initializing") return;
-    client.send({ type: "config", bondThreshold, params: paramsApplied });
-  }, [bondThreshold, client, paramsApplied, status]);
+    client.send({ type: "config", bondThreshold, params: paramsApplied, bondsEverySteps });
+  }, [bondThreshold, bondsEverySteps, client, paramsApplied, status]);
+
+  useEffect(() => {
+    if (graphStatsMode !== "off") return;
+    graphStatsRef.current = null;
+    setGraphStats(null);
+    setGraphStatsN(null);
+  }, [graphStatsMode]);
+
+  useEffect(() => {
+    if (bondsMode !== "off") return;
+    graphStatsRef.current = null;
+    setGraphStats(null);
+    setGraphStatsN(null);
+    lastBondsRefreshStepsRef.current = null;
+  }, [bondsMode]);
+
+  useEffect(() => {
+    const cap = Math.max(50, Math.floor(historyCap));
+    const history = historyRef.current;
+    for (const series of Object.values(history)) {
+      while (series.length > cap) series.shift();
+    }
+  }, [historyCap]);
+
+  useEffect(() => {
+    lastNRef.current = n;
+  }, [n]);
 
   useEffect(() => {
     const layers = metaSnapshot?.layers ?? 0;
@@ -1381,13 +2296,132 @@ export default function App() {
     }
   }, [metaLayerCount, sStackDiffIndex, sStackMetaStart]);
 
+  useEffect(() => {
+    sStackStatsStepRef.current = SSTACK_STATS_EVERY_STEPS;
+  }, [sStackMode, sStackMetaStart, sStackDiffIndex, stackMaxLayers, safeThreshold]);
+
+  useEffect(() => {
+    const interfaces = opkMeta?.interfaces ?? 0;
+    if (interfaces <= 0) {
+      if (opkInterfaceIdx !== 0) setOpkInterfaceIdx(0);
+    } else if (opkInterfaceIdx > interfaces - 1) {
+      setOpkInterfaceIdx(interfaces - 1);
+    }
+    const rCount = opkMeta?.rCount ?? 0;
+    if (rCount <= 0) {
+      if (opkOffsetIdx !== 0) setOpkOffsetIdx(0);
+    } else if (opkOffsetIdx > rCount - 1) {
+      setOpkOffsetIdx(rCount - 1);
+    }
+  }, [opkMeta, opkInterfaceIdx, opkOffsetIdx]);
+
+  useEffect(() => {
+    const canvas = opkCanvasRef.current;
+    const histCanvas = opkHistCanvasRef.current;
+    if (!canvas || !histCanvas) return;
+    const clearCanvases = () => {
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const hctx = histCanvas.getContext("2d");
+      if (hctx) hctx.clearRect(0, 0, histCanvas.width, histCanvas.height);
+    };
+    if (paramsApplied.opCouplingOn < 0.5) {
+      clearCanvases();
+      setOpkViewStatus("waiting");
+      return;
+    }
+    const cache = opkCacheRef.current;
+    const tokens = cache.tokens;
+    if (cache.offsetPairs.length === 0 && cache.offsets) {
+      cache.offsetPairs = parseOpOffsets(cache.offsets);
+    }
+    const offsets = cache.offsetPairs;
+    const meta = opkMeta;
+    const grid = opkFieldRef.current.grid || paramsApplied.gridSize;
+    const cells = grid * grid;
+    if (!tokens || !cache.offsets || !meta) {
+      clearCanvases();
+      setOpkViewStatus("waiting");
+      return;
+    }
+    if (cells <= 0 || cells > OPK_VIEW_MAX_CELLS) {
+      clearCanvases();
+      setOpkViewStatus("waiting");
+      return;
+    }
+    const { budgetK, interfaces, rCount } = meta;
+    if (interfaces <= 0 || rCount <= 0) return;
+    const expectedTokensLen = interfaces * cells * rCount;
+    const expectedOffsetsLen = rCount * 2;
+    const baseLen = opkFieldRef.current.baseS.length;
+    const metaLen = opkFieldRef.current.metaS.length;
+    if (
+      tokens.length < expectedTokensLen ||
+      (cache.offsets?.length ?? 0) < expectedOffsetsLen ||
+      baseLen < cells ||
+      metaLen < interfaces * cells
+    ) {
+      clearCanvases();
+      setOpkViewStatus("mismatch");
+      return;
+    }
+    setOpkViewStatus("ok");
+    const field =
+      opkViewMode === "tokens"
+        ? buildOpkTokenMap(tokens, opkInterfaceIdx, opkOffsetIdx, cells, rCount)
+        : opkViewMode === "total"
+          ? buildOpkTotalMap(tokens, opkInterfaceIdx, cells, rCount)
+          : buildOpkMismatchMap({
+              tokens,
+              offsets,
+              grid,
+              interfaceIdx: opkInterfaceIdx,
+              rCount,
+              budgetK,
+              baseS: opkFieldRef.current.baseS,
+              metaS: opkFieldRef.current.metaS,
+              lS: opkFieldRef.current.lS,
+              diffMax: OPK_DIFF_MAX,
+            });
+    const maxValue = opkViewMode === "mismatch" ? 255 : budgetK;
+    drawFieldHeatmap(canvas, field, grid, maxValue);
+
+    const budget = Math.max(1, Math.min(255, budgetK));
+    const bins = new Array(budget + 1).fill(0);
+    const ifaceStart = opkHistAll ? 0 : opkInterfaceIdx;
+    const ifaceEnd = opkHistAll ? interfaces : opkInterfaceIdx + 1;
+    const span = cells * rCount;
+    for (let iface = ifaceStart; iface < ifaceEnd; iface += 1) {
+      const base = iface * span;
+      for (let i = 0; i < span; i += 1) {
+        const v = tokens[base + i] ?? 0;
+        if (v <= budget) bins[v] += 1;
+      }
+    }
+    drawHistogram(histCanvas, bins, "rgba(160, 200, 255, 0.85)");
+  }, [
+    opkViewMode,
+    opkInterfaceIdx,
+    opkOffsetIdx,
+    opkHistAll,
+    opkPayloadVersion,
+    opkViewVersion,
+    paramsApplied.opCouplingOn,
+    paramsApplied.gridSize,
+    opkMeta?.budgetK,
+    opkMeta?.interfaces,
+    opkMeta?.rCount,
+    opkMeta?.stencilId,
+    opkMeta?.computedAtSteps,
+  ]);
+
   const canInit = status === "idle" || status === "ready";
   const canRun = status === "ready";
   const canPause = status === "running";
 
   const statsById = new Map(layerSafeStats.map((entry) => [entry.id, entry.stats]));
   const stackMetaStart = Math.max(0, Math.min(sStackMetaStart, Math.max(0, metaLayerCount - 1)));
-  const stackMetaCap = Math.max(0, MAX_STACK_LAYERS - 1);
+  const stackMetaCap = Math.max(0, stackMaxLayers - 1);
   const stackMetaCount = Math.min(metaLayerCount - stackMetaStart, stackMetaCap);
   const stackMetaIndices = Array.from(
     { length: Math.max(0, stackMetaCount) },
@@ -1434,6 +2468,30 @@ export default function App() {
       wdiffMeta: current.wdiffMeta,
     });
   };
+  const triggerPerturb = (mode: "randomize" | "zero") => {
+    const stepMark = epStepCounterRef.current > 0 ? epStepCounterRef.current : totalSteps;
+    maintRef.current.lastPerturbStep = stepMark;
+    maintRef.current.recoverySteps = null;
+    maintRef.current.baselineErr = maintStats?.errF0_5 ?? null;
+    maintRef.current.baselineSdiff = maintStats?.sdiffBase ?? null;
+    if (maintStats) {
+      setMaintStats({
+        ...maintStats,
+        lastPerturbStep: stepMark,
+        recoverySteps: null,
+      });
+    }
+    client.send({
+      type: "perturb",
+      params: {
+        target: "metaS",
+        layer: 0,
+        frac: 0.3,
+        mode,
+        seed: seed * 1000 + stepMark,
+      },
+    });
+  };
 
   const showClockPanel =
     clockDebug &&
@@ -1443,7 +2501,78 @@ export default function App() {
       clockDebug.bwd !== 0);
   const clockSteps = clockDebug ? clockDebug.fwd + clockDebug.bwd : 0;
   const stepsTotal = epStepCounterRef.current > 0 ? epStepCounterRef.current : totalSteps;
+  const lastBondsStep = lastBondsRefreshStepsRef.current;
+  const bondsAge = lastBondsStep !== null ? Math.max(0, stepsTotal - lastBondsStep) : null;
+  const bondsFreshText =
+    bondsMode === "off"
+      ? "graph stats disabled (edges off)"
+      : lastBondsStep !== null
+      ? `edges fresh @ step ${lastBondsStep}${bondsAge !== null ? ` (age ${bondsAge})` : ""}`
+      : "edges not refreshed yet";
   const clockDrift = clockDebug && stepsTotal > 0 ? clockDebug.q / stepsTotal : 0;
+  const turLine =
+    turStats !== null
+      ? `TUR blocks ${turStats.blocks} | meanΔQ ${formatTURValue(turStats.meanQ)} | varΔQ ${formatTURValue(
+          turStats.varQ
+        )} | meanΔΣ ${formatTURValue(turStats.meanSigma)} | R ${formatTURValue(turStats.R)}`
+      : null;
+  const opkDebugLine = opkStats
+    ? `Sdiff_op ${formatTURValue(opkStats.sdiffMean)} | budgetOk ${
+        opkStats.budgetOk ? "true" : "false"
+      } | badCells ${opkStats.badCells}`
+    : null;
+  const opkMetaLine = opkStats
+    ? `budgetK ${opkStats.budgetK} | rCount ${opkStats.rCount} | interfaces ${opkStats.interfaces} | stencil ${opkStats.stencilId}`
+    : null;
+  const opkViewTooLarge = paramsApplied.gridSize * paramsApplied.gridSize > OPK_VIEW_MAX_CELLS;
+  const hasOpkPayload =
+    opkPayloadVersion > 0 &&
+    opkCacheRef.current.tokens !== null &&
+    opkCacheRef.current.offsets !== null;
+  const opkOffsetLabel = opkCacheRef.current.offsetPairs[opkOffsetIdx]
+    ? `(${opkCacheRef.current.offsetPairs[opkOffsetIdx]![0]}, ${opkCacheRef.current.offsetPairs[opkOffsetIdx]![1]})`
+    : "";
+  const opkPayloadSteps = opkMeta?.computedAtSteps;
+  const opkPayloadAge =
+    opkPayloadSteps !== undefined && opkPayloadSteps !== null ? stepsTotal - opkPayloadSteps : null;
+  const maintErrText =
+    maintStats?.errF0_5 !== null && maintStats?.errF0_5 !== undefined
+      ? formatTURValue(maintStats.errF0_5)
+      : "n/a";
+  const maintSdiffText =
+    maintStats?.sdiffBase !== null && maintStats?.sdiffBase !== undefined
+      ? formatTURValue(maintStats.sdiffBase)
+      : "n/a";
+  const maintRepairText =
+    maintStats?.epRepairRate !== null && maintStats?.epRepairRate !== undefined
+      ? formatTURValue(maintStats.epRepairRate)
+      : "n/a";
+  const maintClockText =
+    maintStats?.epClockRate !== null && maintStats?.epClockRate !== undefined
+      ? formatTURValue(maintStats.epClockRate)
+      : "n/a";
+  const maintNoiseText =
+    maintStats?.noiseExpectedEdits !== null && maintStats?.noiseExpectedEdits !== undefined
+      ? formatTURValue(maintStats.noiseExpectedEdits)
+      : "n/a";
+  const maintPerturbText =
+    maintStats?.lastPerturbStep !== null && maintStats?.lastPerturbStep !== undefined
+      ? `last perturb ${maintStats.lastPerturbStep}`
+      : "no perturb";
+  const maintRecoveryText =
+    maintStats?.recoverySteps !== null && maintStats?.recoverySteps !== undefined
+      ? `recovery ${maintStats.recoverySteps}`
+      : "recovery n/a";
+
+  const effectiveDraft = effectiveParams(paramsDraft);
+  const activePrimitives = {
+    p1: effectiveDraft.pWrite > 0,
+    p2: effectiveDraft.pAWrite > 0,
+    p3: effectiveDraft.p3On > 0,
+    p4: effectiveDraft.pNWrite > 0,
+    p5: effectiveDraft.pSWrite > 0,
+    p6: effectiveDraft.p6On > 0,
+  };
 
   const presetGroups = PRESET_CATALOG.reduce<Record<string, PresetEntry[]>>((acc, entry) => {
     acc[entry.group] = acc[entry.group] ?? [];
@@ -1494,8 +2623,22 @@ export default function App() {
                 n,
                 seed,
                 bondThreshold,
-                params: paramsApplied,
+                paramsApplied,
+                presetId,
+                presetSourcePath: selectedPreset?.sourcePath,
+                supports: selectedPreset?.supports,
                 captureEverySteps: recordEverySteps,
+                uiConfig: {
+                  snapshotVersion: SNAPSHOT_VERSION,
+                  epWindowSteps: EP_WINDOW_STEPS,
+                  certStabilityK: CERT_STABILITY_K,
+                  turBlockSteps: TUR_BLOCK_STEPS,
+                  opkPayloadEverySteps: OPK_PAYLOAD_EVERY_STEPS,
+                  maintEverySteps: MAINT_EVERY_STEPS,
+                  bondsEverySteps,
+                  bondsMode,
+                  graphStatsMode,
+                },
               });
               setCaptureEverySteps(recordEverySteps);
               client.send({ type: "init", n, seed });
@@ -1614,6 +2757,9 @@ export default function App() {
               }}
               disabled={status === "initializing"}
             />
+            <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+              Affects chart sampling + run export capture.
+            </p>
           </div>
           <div>
             <label>Color overlay</label>
@@ -1626,6 +2772,95 @@ export default function App() {
               <option value="p4">P4 counters</option>
               <option value="p2">P2 apparatus</option>
             </select>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Performance</div>
+          <div className="row twoCol">
+            <div>
+              <label>Bonds/edges updates</label>
+              <select
+                value={bondsMode}
+                onChange={(e) => setBondsMode(e.target.value as "live" | "chart" | "off")}
+                disabled={status === "initializing"}
+              >
+                <option value="live">Live (every snapshot)</option>
+                <option value="chart">Chart cadence</option>
+                <option value="off">Off</option>
+              </select>
+              <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+                Reducing edges updates speeds up runs; graph stats depend on edges.
+              </p>
+            </div>
+            <div>
+              <label>Graph stats</label>
+              <select
+                value={graphStatsMode}
+                onChange={(e) => setGraphStatsMode(e.target.value as "auto" | "ondemand" | "off")}
+                disabled={status === "initializing"}
+              >
+                <option value="auto">Auto</option>
+                <option value="ondemand">On-demand</option>
+                <option value="off">Off</option>
+              </select>
+              <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>{bondsFreshText}</p>
+              {graphStatsMode === "ondemand" ? (
+                <div style={{ marginTop: 6 }}>
+                  <button
+                    onClick={() => {
+                      const bonds = bondsCacheRef.current;
+                      const nVal = lastNRef.current;
+                      if (!bonds || bonds.length === 0 || nVal <= 0) {
+                        graphStatsRef.current = null;
+                        setGraphStats(null);
+                        setGraphStatsN(null);
+                        return;
+                      }
+                      const stats = computeGraphStats(nVal, bonds);
+                      graphStatsRef.current = stats;
+                      setGraphStats(stats);
+                      setGraphStatsN(nVal);
+                    }}
+                    disabled={status === "idle" || status === "initializing" || bondsMode === "off"}
+                  >
+                    Compute graph stats now
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div className="row twoCol">
+            <div>
+              <label>Layer stack max layers</label>
+              <input
+                type="number"
+                min={1}
+                max={8}
+                step={1}
+                value={stackMaxLayers}
+                onChange={(e) => {
+                  const v = Math.max(1, Math.min(8, Math.floor(Number(e.target.value))));
+                  setStackMaxLayers(v);
+                }}
+                disabled={status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>History points kept</label>
+              <input
+                type="number"
+                min={50}
+                max={5000}
+                step={1}
+                value={historyCap}
+                onChange={(e) => {
+                  const v = Math.max(50, Math.min(5000, Math.floor(Number(e.target.value))));
+                  setHistoryCap(v);
+                }}
+                disabled={status === "initializing"}
+              />
+            </div>
           </div>
         </div>
 
@@ -1700,6 +2935,34 @@ export default function App() {
                 Source: {selectedPreset.sourcePath}
               </p>
             ) : null}
+            <p
+              style={{
+                marginTop: 6,
+                fontSize: 12,
+                color: "var(--muted)",
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              }}
+            >
+              Active primitives:{" "}
+              <span style={{ color: activePrimitives.p1 ? "#8de0c6" : "#ff9aa2" }}>
+                P1{activePrimitives.p1 ? "✅" : "❌"}
+              </span>{" "}
+              <span style={{ color: activePrimitives.p2 ? "#8de0c6" : "#ff9aa2" }}>
+                P2{activePrimitives.p2 ? "✅" : "❌"}
+              </span>{" "}
+              <span style={{ color: activePrimitives.p3 ? "#8de0c6" : "#ff9aa2" }}>
+                P3{activePrimitives.p3 ? "✅" : "❌"}
+              </span>{" "}
+              <span style={{ color: activePrimitives.p4 ? "#8de0c6" : "#ff9aa2" }}>
+                P4{activePrimitives.p4 ? "✅" : "❌"}
+              </span>{" "}
+              <span style={{ color: activePrimitives.p5 ? "#8de0c6" : "#ff9aa2" }}>
+                P5{activePrimitives.p5 ? "✅" : "❌"}
+              </span>{" "}
+              <span style={{ color: activePrimitives.p6 ? "#8de0c6" : "#ff9aa2" }}>
+                P6{activePrimitives.p6 ? "✅" : "❌"}
+              </span>
+            </p>
           </div>
         </div>
 
@@ -1933,6 +3196,399 @@ export default function App() {
             )}
           </div>
         ) : null}
+
+        <div className="accordion">
+          <div 
+            className="accordionTitle"
+            onClick={() => setExpandedPanels(prev => ({ ...prev, clock: !prev.clock }))}
+            style={{ cursor: 'pointer', userSelect: 'none' }}
+          >
+            <span>{expandedPanels.clock ? '▼' : '▶'}</span> Clock / TUR
+          </div>
+          {expandedPanels.clock && (
+          <div className="accordionContent">
+          <div className="row">
+            <div>
+              <label>clockOn</label>
+              <input
+                type="checkbox"
+                checked={paramsDraft.clockOn >= 0.5}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, clockOn: e.target.checked ? 1 : 0 }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>clockUsesP6</label>
+              <input
+                type="checkbox"
+                checked={paramsDraft.clockUsesP6 >= 0.5}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, clockUsesP6: e.target.checked ? 1 : 0 }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>clockK</label>
+              <input
+                type="number"
+                step={1}
+                min={1}
+                value={paramsDraft.clockK}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, clockK: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>clockFrac</label>
+              <input
+                type="number"
+                step={0.001}
+                min={0}
+                max={1}
+                value={paramsDraft.clockFrac}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, clockFrac: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>clockFrac slider</label>
+              <input
+                type="range"
+                step={0.001}
+                min={0}
+                max={1}
+                value={paramsDraft.clockFrac}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, clockFrac: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div />
+          </div>
+          <div className="row">
+            <div>
+              <label>repairClockGated</label>
+              <input
+                type="checkbox"
+                checked={paramsDraft.repairClockGated >= 0.5}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, repairClockGated: e.target.checked ? 1 : 0 }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>repairGateMode</label>
+              <input
+                type="number"
+                step={1}
+                value={paramsDraft.repairGateMode}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, repairGateMode: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>repairGateSpan</label>
+              <input
+                type="number"
+                step={1}
+                value={paramsDraft.repairGateSpan}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, repairGateSpan: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div />
+          </div>
+          </div>
+          )}
+        </div>
+
+        <div className="accordion">
+          <div 
+            className="accordionTitle"
+            onClick={() => setExpandedPanels(prev => ({ ...prev, opk: !prev.opk }))}
+            style={{ cursor: 'pointer', userSelect: 'none' }}
+          >
+            <span>{expandedPanels.opk ? '▼' : '▶'}</span> opK coupling
+          </div>
+          {expandedPanels.opk && (
+          <div className="accordionContent">
+          <div className="row">
+            <div>
+              <label>opCouplingOn</label>
+              <input
+                type="checkbox"
+                checked={paramsDraft.opCouplingOn >= 0.5}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, opCouplingOn: e.target.checked ? 1 : 0 }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>opDriveOnK</label>
+              <input
+                type="checkbox"
+                checked={paramsDraft.opDriveOnK >= 0.5}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, opDriveOnK: e.target.checked ? 1 : 0 }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>sCouplingMode</label>
+              <select
+                value={paramsDraft.sCouplingMode}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, sCouplingMode: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              >
+                <option value={0}>0</option>
+                <option value={1}>1</option>
+              </select>
+            </div>
+            <div>
+              <label>opStencil</label>
+              <select
+                value={paramsDraft.opStencil}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, opStencil: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              >
+                <option value={0}>0</option>
+                <option value={1}>1</option>
+              </select>
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>opBudgetK</label>
+              <input
+                type="number"
+                step={1}
+                min={1}
+                value={paramsDraft.opBudgetK}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, opBudgetK: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>opKTargetWeight</label>
+              <input
+                type="number"
+                step={0.01}
+                min={0}
+                value={paramsDraft.opKTargetWeight}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, opKTargetWeight: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          </div>
+          )}
+        </div>
+
+        <div className="accordion">
+          <div 
+            className="accordionTitle"
+            onClick={() => setExpandedPanels(prev => ({ ...prev, maintenance: !prev.maintenance }))}
+            style={{ cursor: 'pointer', userSelect: 'none' }}
+          >
+            <span>{expandedPanels.maintenance ? '▼' : '▶'}</span> Maintenance (noise + repair)
+          </div>
+          {expandedPanels.maintenance && (
+          <div className="accordionContent">
+          <div className="row">
+            <div>
+              <label>codeNoiseRate</label>
+              <input
+                type="number"
+                step={0.0001}
+                min={0}
+                max={1}
+                value={paramsDraft.codeNoiseRate}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, codeNoiseRate: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>codeNoiseRate slider</label>
+              <input
+                type="range"
+                step={0.0001}
+                min={0}
+                max={1}
+                value={paramsDraft.codeNoiseRate}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, codeNoiseRate: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>codeNoiseBatch</label>
+              <input
+                type="number"
+                step={1}
+                min={1}
+                value={paramsDraft.codeNoiseBatch}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, codeNoiseBatch: Math.max(1, Math.floor(Number(e.target.value))) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>codeNoiseLayer</label>
+              <input
+                type="number"
+                step={1}
+                min={0}
+                max={Math.max(0, paramsDraft.metaLayers - 1)}
+                value={paramsDraft.codeNoiseLayer}
+                onChange={(e) => {
+                  const maxLayer = Math.max(0, paramsDraft.metaLayers - 1);
+                  const next = Math.max(0, Math.min(maxLayer, Math.floor(Number(e.target.value))));
+                  setParamsDraft((p) => ({ ...p, codeNoiseLayer: next }));
+                }}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>etaDrive</label>
+              <input
+                type="number"
+                step={0.01}
+                min={0}
+                max={2}
+                value={paramsDraft.etaDrive}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, etaDrive: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>p6SFactor</label>
+              <input
+                type="number"
+                step={0.01}
+                min={0}
+                max={1}
+                value={paramsDraft.p6SFactor}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, p6SFactor: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>etaDrive slider</label>
+              <input
+                type="range"
+                step={0.01}
+                min={0}
+                max={2}
+                value={paramsDraft.etaDrive}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, etaDrive: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>p6SFactor slider</label>
+              <input
+                type="range"
+                step={0.01}
+                min={0}
+                max={1}
+                value={paramsDraft.p6SFactor}
+                onChange={(e) => setParamsDraft((p) => ({ ...p, p6SFactor: Number(e.target.value) }))}
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>repairClockGated</label>
+              <input
+                type="checkbox"
+                checked={paramsDraft.repairClockGated >= 0.5}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, repairClockGated: e.target.checked ? 1 : 0 }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div>
+              <label>repairGateMode</label>
+              <input
+                type="number"
+                step={1}
+                value={paramsDraft.repairGateMode}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, repairGateMode: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div>
+              <label>repairGateSpan</label>
+              <input
+                type="number"
+                step={1}
+                value={paramsDraft.repairGateSpan}
+                onChange={(e) =>
+                  setParamsDraft((p) => ({ ...p, repairGateSpan: Number(e.target.value) }))
+                }
+                disabled={status === "idle" || status === "initializing"}
+              />
+            </div>
+            <div />
+          </div>
+          <div className="row">
+            <button
+              type="button"
+              onClick={() => triggerPerturb("randomize")}
+              disabled={status === "idle" || status === "initializing" || paramsApplied.metaLayers < 1}
+            >
+              Perturb meta0 (30% randomize)
+            </button>
+            <button
+              type="button"
+              onClick={() => triggerPerturb("zero")}
+              disabled={status === "idle" || status === "initializing" || paramsApplied.metaLayers < 1}
+            >
+              Perturb meta0 (30% zero)
+            </button>
+          </div>
+          </div>
+          )}
+        </div>
 
         {p2Enabled ? (
           <div className="accordion">
@@ -2171,9 +3827,6 @@ export default function App() {
               setError(null);
               const applied = effectiveParams(paramsDraft);
               setParamsApplied(applied);
-              if (status !== "idle" && status !== "initializing") {
-                client.send({ type: "config", bondThreshold, params: applied });
-              }
             }}
             disabled={status === "initializing" || shallowEqual(effectiveParams(paramsDraft), paramsApplied)}
           >
@@ -2246,9 +3899,30 @@ export default function App() {
               fwd/bwd {clockDebug.fwd} / {clockDebug.bwd} | steps {clockSteps} | drift{" "}
               {clockDrift.toExponential(3)}
             </p>
+            {turLine ? (
+              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                {turLine}
+              </p>
+            ) : null}
           </div>
         ) : null}
-        {certPassed.epNull || certPassed.sigmaNull || certPassed.m6Null ? (
+        {opkDebugLine && opkMetaLine ? (
+          <div style={{ marginTop: 6 }}>
+            <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+              opK {opkDebugLine}
+            </p>
+            <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+              opK {opkMetaLine}
+            </p>
+          </div>
+        ) : null}
+        {certPassed.epNull ||
+        certPassed.sigmaNull ||
+        certPassed.m6Null ||
+        certPassed.clockNull ||
+        certPassed.tur ||
+        certPassed.opkBudget ||
+        certPassed.codeMaint ? (
           <div style={{ marginTop: 8 }}>
             <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
               Certificates
@@ -2266,6 +3940,26 @@ export default function App() {
             {certPassed.m6Null ? (
               <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
                 ✅ Null M6 motifs ~ 0
+              </p>
+            ) : null}
+            {certPassed.clockNull ? (
+              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                ✅ Null clock drift ~ 0
+              </p>
+            ) : null}
+            {certPassed.tur ? (
+              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                ✅ TUR ratio R ≥ 1 (estimate)
+              </p>
+            ) : null}
+            {certPassed.opkBudget ? (
+              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                ✅ opK budget conserved
+              </p>
+            ) : null}
+            {certPassed.codeMaint ? (
+              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                ✅ Code maintenance: low error with EP&gt;0
               </p>
             ) : null}
           </div>
@@ -2309,7 +4003,7 @@ export default function App() {
             {diagnostics.aM6A.toFixed(4)} S {diagnostics.aM6S.toFixed(4)}
           </p>
         ) : null}
-        {graphStats && graphStatsN ? (
+        {graphStatsMode !== "off" && graphStats && graphStatsN ? (
           <p style={{ marginTop: 6, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
             Graph edges {graphStats.edges} | components {graphStats.components} | largest{" "}
             {graphStats.largest}/{graphStatsN} ({(graphStats.largest / graphStatsN).toFixed(2)})
@@ -2336,12 +4030,12 @@ export default function App() {
       </div>
 
       <div className="main">
-        <div className="canvasWrap">
-          <canvas ref={canvasRef} />
-        </div>
-        <div className="chartsPanel">
+        <div className="topRow">
+          <div className="canvasWrap">
+            <canvas ref={canvasRef} />
+          </div>
           {metaLayerCount > 0 ? (
-            <div className="sStackSection">
+            <div className="sStackSection sStackSection--side">
               <div className="sStackHeader">
                 <div className="sStackTitle">S Layer Stack</div>
                 <div className="sStackControls">
@@ -2373,7 +4067,7 @@ export default function App() {
                       />
                     </label>
                   ) : null}
-                  {sStackMode === "layers" && metaLayerCount > MAX_STACK_LAYERS - 1 ? (
+                  {sStackMode === "layers" && metaLayerCount > stackMaxLayers - 1 ? (
                     <label>
                       start
                       <input
@@ -2417,6 +4111,8 @@ export default function App() {
               </div>
             </div>
           ) : null}
+        </div>
+        <div className="chartsPanel">
           {metaLayerCount >= 2 && metaAlignCurrent ? (
             <div className="metaAlignSection">
               <div className="metaAlignHeader">
@@ -2480,6 +4176,136 @@ export default function App() {
                     </div>
                   );
                 })}
+              </div>
+            </div>
+          ) : null}
+          {paramsApplied.opCouplingOn >= 0.5 && hasOpkPayload ? (
+            <div className="opkSection">
+              <div className="opkHeader">
+                <div className="opkTitle">opK view</div>
+                <div className="opkControls">
+                  <label>
+                    Interface
+                    <select
+                      value={opkInterfaceIdx}
+                      onChange={(e) => setOpkInterfaceIdx(Math.max(0, Math.floor(Number(e.target.value))))}
+                    >
+                      {Array.from({ length: opkMeta?.interfaces ?? 0 }, (_, i) => (
+                        <option key={i} value={i}>
+                          {i}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    View
+                    <select
+                      value={opkViewMode}
+                      onChange={(e) =>
+                        setOpkViewMode(e.target.value as "tokens" | "total" | "mismatch")
+                      }
+                    >
+                      <option value="tokens">Tokens (offset r)</option>
+                      <option value="total">Total tokens per cell</option>
+                      <option value="mismatch">Mismatch |upper - pred|</option>
+                    </select>
+                  </label>
+                  {opkViewMode === "tokens" ? (
+                    <label>
+                      Offset r {opkOffsetLabel}
+                      <select
+                        value={opkOffsetIdx}
+                        onChange={(e) => setOpkOffsetIdx(Math.max(0, Math.floor(Number(e.target.value))))}
+                      >
+                        {Array.from({ length: opkMeta?.rCount ?? 0 }, (_, i) => (
+                          <option key={i} value={i}>
+                            {i}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  <label className="opkCheckbox">
+                    <input
+                      type="checkbox"
+                      checked={opkHistAll}
+                      onChange={(e) => setOpkHistAll(e.target.checked)}
+                    />
+                    Hist all interfaces
+                  </label>
+                </div>
+                <div className="opkNote">
+                  payload@steps {opkPayloadSteps ?? "n/a"}
+                  {opkPayloadAge !== null ? ` | age ${opkPayloadAge}` : ""}
+                </div>
+              </div>
+              {opkViewTooLarge ? (
+                <div className="opkNote">
+                  opK view paused: grid {paramsApplied.gridSize}x{paramsApplied.gridSize} exceeds cap
+                  ({OPK_VIEW_MAX_CELLS} cells).
+                </div>
+              ) : opkViewStatus === "mismatch" ? (
+                <div className="opkNote">Waiting for opK payload refresh (shape mismatch).</div>
+              ) : null}
+              <div className="opkGrid">
+                <div className="opkCard">
+                  <div className="opkLabel">
+                    {opkViewMode === "tokens"
+                      ? `Token map (r ${opkOffsetIdx})`
+                      : opkViewMode === "total"
+                        ? "Total tokens per cell"
+                        : "Mismatch |upper - pred|"}
+                  </div>
+                  <canvas className="opkCanvas" ref={opkCanvasRef} />
+                  {opkViewMode === "mismatch" ? (
+                    <div className="opkNote">diff max {OPK_DIFF_MAX}</div>
+                  ) : null}
+                </div>
+                <div className="opkCard">
+                  <div className="opkLabel">Token histogram</div>
+                  <canvas className="opkHistCanvas" ref={opkHistCanvasRef} />
+                  <div className="opkNote">bins 0..{opkMeta?.budgetK ?? 0}</div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {paramsApplied.metaLayers >= 1 ? (
+            <div className="maintSection">
+              <div className="maintHeader">
+                <div className="maintTitle">Maintenance</div>
+                <div className="maintStatus">
+                  noise expected/window {maintNoiseText} | repairGate{" "}
+                  {paramsApplied.repairClockGated >= 0.5 ? "on" : "off"}
+                </div>
+              </div>
+              <div className="maintGrid">
+                <div className="maintCard">
+                  <div className="maintLabel">errF0.5</div>
+                  <div className="maintValue">{maintErrText}</div>
+                  <canvas
+                    className="maintCanvas"
+                    ref={(el) => (maintCanvasRefs.current["maint_err"] = el)}
+                  />
+                </div>
+                <div className="maintCard">
+                  <div className="maintLabel">sdiff base</div>
+                  <div className="maintValue">{maintSdiffText}</div>
+                  <canvas
+                    className="maintCanvas"
+                    ref={(el) => (maintCanvasRefs.current["maint_sdiff"] = el)}
+                  />
+                </div>
+                <div className="maintCard">
+                  <div className="maintLabel">repair rate</div>
+                  <div className="maintValue">{maintRepairText}</div>
+                  <canvas
+                    className="maintCanvas"
+                    ref={(el) => (maintCanvasRefs.current["maint_repair"] = el)}
+                  />
+                </div>
+              </div>
+              <div className="maintNote">
+                clock rate {maintClockText} | {maintPerturbText} | {maintRecoveryText}
               </div>
             </div>
           ) : null}
@@ -2553,6 +4379,7 @@ function shallowEqual(a: SimParams, b: SimParams): boolean {
     "sCouplingMode",
     "opStencil",
     "opBudgetK",
+    "opKTargetWeight",
     "opDriveOnK",
   ];
   return keys.every((k) => a[k] === b[k]);

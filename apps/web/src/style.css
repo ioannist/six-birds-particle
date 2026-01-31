@@ -24,7 +24,7 @@ body {
 .app {
   display: grid;
   grid-template-columns: 320px 1fr;
-  height: 100vh;
+  min-height: 100vh;
 }
 
 .panel {
@@ -193,23 +193,37 @@ body {
 }
 
 .main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.topRow {
   display: grid;
-  grid-template-rows: 1fr auto;
-  height: 100vh;
-  overflow: hidden;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 460px);
+  gap: 16px;
+  align-items: stretch;
+  padding: 12px 16px 12px;
 }
 
 .canvasWrap {
   position: relative;
   display: grid;
-  place-items: center;
+  align-items: center;
+  justify-items: start;
   min-height: 0;
-  padding: 16px;
+  height: 500px;
+  max-height: 500px;
+  padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: var(--bg);
 }
 
 canvas {
-  width: min(92vmin, 980px);
-  height: auto;
+  display: block;
+  width: min(100%, 500px);
+  height: min(100%, 500px);
   aspect-ratio: 1 / 1;
   max-width: 100%;
   max-height: 100%;
@@ -220,9 +234,9 @@ canvas {
 
 .chartsPanel {
   padding: 12px 16px 14px;
-  background: linear-gradient(180deg, rgba(11, 15, 20, 0.1), rgba(11, 15, 20, 0.85));
+  background: var(--bg);
   border-top: 1px solid var(--border);
-  backdrop-filter: blur(6px);
+  backdrop-filter: none;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 12px;
@@ -236,6 +250,21 @@ canvas {
   padding: 10px 12px;
   display: grid;
   gap: 10px;
+}
+
+.sStackSection.sStackSection--side {
+  grid-column: 2;
+  height: 500px;
+  max-height: 500px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.sStackSection.sStackSection--side .sStackGrid {
+  overflow: auto;
+  padding-bottom: 6px;
+  flex: 1;
 }
 
 .sStackHeader {
@@ -397,6 +426,177 @@ canvas {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.02);
+}
+
+.opkSection {
+  grid-column: 1 / -1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.opkHeader {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.opkTitle {
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.opkControls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.opkControls label {
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.opkControls select,
+.opkControls input {
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.opkCheckbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.opkGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.opkCard {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.opkLabel {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.opkCanvas {
+  width: 100%;
+  height: 180px;
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.opkHistCanvas {
+  width: 100%;
+  height: 80px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.opkNote {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.maintSection {
+  grid-column: 1 / -1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.maintHeader {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.maintTitle {
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.maintStatus {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.maintGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.maintCard {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.maintLabel {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.maintValue {
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.maintCanvas {
+  width: 100%;
+  height: 58px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.maintNote {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .chartCard {

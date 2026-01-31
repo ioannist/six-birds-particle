@@ -54,10 +54,7 @@ if version_file.exists():
         current_version = int(raw)
 
 next_version = current_version + 1
-suffix = os.environ.get("SNAPSHOT_SUFFIX", "").strip()
-if suffix and not suffix.startswith("_"):
-    suffix = f"_{suffix}"
-zip_path = root / f"{repo_name}_snapshot_v{next_version}{suffix}.zip"
+zip_path = root / f"{repo_name}_snapshot_v{next_version}.zip"
 
 @dataclass(frozen=True)
 class IgnoreRule:
@@ -230,12 +227,6 @@ if current_version >= 0:
     previous_path = root / f"{repo_name}_snapshot_v{current_version}.zip"
 if previous_path and previous_path.exists():
     previous_path.unlink()
-
-for path in root.glob(f"{repo_name}_snapshot_v*.zip"):
-    if path == zip_path:
-        continue
-    if path.exists():
-        path.unlink()
 
 print(f"Wrote {zip_path}")
 PY

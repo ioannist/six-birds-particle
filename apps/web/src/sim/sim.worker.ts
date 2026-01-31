@@ -5,7 +5,17 @@ let wasmMod: any | null = null;
 let sim: any | null = null;
 let running = false;
 let bondThreshold = 2;
+let bondsEverySteps = 1;
+let cachedBonds: Uint32Array | null = null;
+let lastBondsSteps = -1;
 let pendingParams: any | null = null;
+let lastParams: any | null = null;
+let totalSteps = 0;
+let lastOpkPayloadSteps = -20000;
+let cachedOpkTokens: Uint8Array | null = null;
+let cachedOpkOffsets: Int8Array | null = null;
+
+const OPK_PAYLOAD_EVERY_STEPS = 20000;
 
 function post(message: SimMessage) {
   postMessage(message);
@@ -17,12 +27,53 @@ function debug(message: string) {
 
 debug("Worker bootstrap (WASM).");
 
-function buildSnapshot(simRef: any, bondLimit: number, steps: number): SimSnapshot {
+function buildSnapshot(
+  simRef: any,
+  bondLimit: number,
+  steps: number,
+  forceOpkRefresh = false
+): SimSnapshot {
+  const opkEnabled = lastParams ? lastParams.opCouplingOn >= 0.5 : false;
+  const opkInterfaces = Number(simRef.op_interfaces?.() ?? 0);
+  const opkRCount = Number(simRef.op_r_count?.() ?? 0);
+  const opkBudgetK = Number(simRef.op_budget_k?.() ?? 0);
+  const opkStencilId = Number(simRef.op_stencil_id?.() ?? 0);
+  const shouldRefreshOpk =
+    forceOpkRefresh ||
+    (opkEnabled &&
+      opkInterfaces > 0 &&
+      opkRCount > 0 &&
+      totalSteps - lastOpkPayloadSteps >= OPK_PAYLOAD_EVERY_STEPS);
+  let opkTokens: Uint8Array | undefined;
+  let opkOffsets: Int8Array | undefined;
+  let opkComputedAt: number | undefined;
+  if (shouldRefreshOpk) {
+    cachedOpkOffsets = simRef.op_offsets();
+    cachedOpkTokens = simRef.op_k_tokens();
+    lastOpkPayloadSteps = totalSteps;
+    opkOffsets = cachedOpkOffsets;
+    opkTokens = cachedOpkTokens;
+    opkComputedAt = totalSteps;
+  } else if (cachedOpkTokens) {
+    opkComputedAt = lastOpkPayloadSteps;
+  }
+
+  let bonds = new Uint32Array();
+  if (bondsEverySteps > 0) {
+    if (totalSteps === 0 || lastBondsSteps < 0 || totalSteps - lastBondsSteps >= bondsEverySteps) {
+      cachedBonds = simRef.bonds(bondLimit);
+      lastBondsSteps = totalSteps;
+      bonds = cachedBonds;
+    }
+  } else {
+    cachedBonds = null;
+  }
+
   return {
     snapshotVersion: SNAPSHOT_VERSION,
     n: simRef.n(),
     positions: simRef.positions(),
-    bonds: simRef.bonds(bondLimit),
+    bonds,
     counters: simRef.counters(),
     apparatus: simRef.apparatus(),
     field: simRef.field(),
@@ -39,12 +90,23 @@ function buildSnapshot(simRef: any, bondLimit: number, steps: number): SimSnapsh
       ep: {
         exactTotal: simRef.ep_exact_total(),
         naiveTotal: simRef.ep_naive_total(),
+        exactByMove: simRef.ep_exact_by_move(),
       },
       clock: {
         state: simRef.clock_state(),
         q: Number(simRef.clock_q()),
         fwd: Number(simRef.clock_fwd()),
         bwd: Number(simRef.clock_bwd()),
+      },
+      opk: {
+        enabled: opkEnabled,
+        budgetK: opkBudgetK,
+        interfaces: opkInterfaces,
+        rCount: opkRCount,
+        stencilId: opkStencilId,
+        offsets: opkOffsets,
+        tokens: opkTokens,
+        computedAtSteps: opkComputedAt,
       },
     },
   };
@@ -64,6 +126,7 @@ async function ensureSim() {
 async function tick(mod: any) {
   if (!running || !sim) return;
   const steps = 500;
+  totalSteps += steps;
   sim.step(steps);
   const snapshot = buildSnapshot(sim, bondThreshold, steps);
   post({ type: "snapshot", snapshot });
@@ -79,10 +142,17 @@ self.onmessage = async (ev: MessageEvent<SimRequest>) => {
 
     if (req.type === "init") {
       debug("Constructing Sim…");
+      totalSteps = 0;
+      cachedBonds = null;
+      lastBondsSteps = -Math.max(1, bondsEverySteps);
+      lastOpkPayloadSteps = -OPK_PAYLOAD_EVERY_STEPS;
+      cachedOpkTokens = null;
+      cachedOpkOffsets = null;
       sim = new mod.Sim(req.n, req.seed);
       if (pendingParams) {
         debug("Applying pending params…");
         sim.set_params(pendingParams);
+        lastParams = pendingParams;
         pendingParams = null;
       }
       debug("Sim constructed; posting ready + initial snapshot.");
@@ -93,7 +163,37 @@ self.onmessage = async (ev: MessageEvent<SimRequest>) => {
     }
 
     if (req.type === "config") {
+      const prevBondThreshold = bondThreshold;
       bondThreshold = Math.max(0, Math.min(255, Math.floor(req.bondThreshold)));
+      const prevBondsEverySteps = bondsEverySteps;
+      if (typeof req.bondsEverySteps === "number") {
+        bondsEverySteps = Math.max(0, Math.floor(req.bondsEverySteps));
+      }
+      const bondsCadenceChanged = prevBondsEverySteps !== bondsEverySteps;
+      if (bondsCadenceChanged || bondThreshold !== prevBondThreshold) {
+        lastBondsSteps = -Math.max(1, bondsEverySteps || 1);
+      }
+      if (bondsEverySteps <= 0) {
+        cachedBonds = null;
+      }
+      const prevParams = lastParams;
+      lastParams = req.params;
+      const opkParamsChanged =
+        !prevParams ||
+        prevParams.opCouplingOn !== req.params.opCouplingOn ||
+        prevParams.metaLayers !== req.params.metaLayers ||
+        prevParams.gridSize !== req.params.gridSize ||
+        prevParams.opStencil !== req.params.opStencil ||
+        prevParams.opBudgetK !== req.params.opBudgetK ||
+        prevParams.opKTargetWeight !== req.params.opKTargetWeight ||
+        prevParams.sCouplingMode !== req.params.sCouplingMode ||
+        prevParams.opDriveOnK !== req.params.opDriveOnK;
+      const shouldForceOpk =
+        opkParamsChanged && req.params.opCouplingOn >= 0.5 && req.params.metaLayers >= 1;
+      if (req.params.opCouplingOn < 0.5) {
+        cachedOpkTokens = null;
+        cachedOpkOffsets = null;
+      }
       if (!sim) {
         pendingParams = req.params;
         debug("Stored config params (will apply on init).");
@@ -101,7 +201,7 @@ self.onmessage = async (ev: MessageEvent<SimRequest>) => {
       }
       sim.set_params(req.params);
       debug(`Updated bondThreshold=${bondThreshold}`);
-      const snapshot = buildSnapshot(sim, bondThreshold, 0);
+      const snapshot = buildSnapshot(sim, bondThreshold, 0, shouldForceOpk);
       post({ type: "snapshot", snapshot });
       return;
     }
@@ -109,8 +209,16 @@ self.onmessage = async (ev: MessageEvent<SimRequest>) => {
     if (!sim) throw new Error("Simulation not initialized; send {type:'init'} first.");
 
     if (req.type === "step") {
+      totalSteps += req.steps;
       sim.step(req.steps);
       const snapshot = buildSnapshot(sim, bondThreshold, req.steps);
+      post({ type: "snapshot", snapshot });
+      return;
+    }
+
+    if (req.type === "perturb") {
+      sim.apply_perturbation(req.params);
+      const snapshot = buildSnapshot(sim, bondThreshold, 0);
       post({ type: "snapshot", snapshot });
       return;
     }
