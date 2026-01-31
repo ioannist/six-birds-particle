@@ -35,7 +35,76 @@ body {
 
 .panel h1 {
   font-size: 16px;
-  margin: 0 0 8px 0;
+  margin: 0;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.titleActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.helpBtn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.helpBtn:hover {
+  background: rgba(120, 170, 255, 0.18);
+  color: var(--text);
+}
+
+.resetBtn {
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(255, 100, 100, 0.1);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.resetBtn:hover {
+  background: rgba(255, 100, 100, 0.25);
+  color: var(--text);
+}
+
+.helpBox {
+  margin: 6px 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.helpTitle {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
 }
 
 .panel p {
@@ -81,6 +150,13 @@ body {
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.04);
   color: var(--text);
+  color-scheme: dark;
+}
+
+.panel select option,
+.panel select optgroup {
+  background: var(--panel);
+  color: var(--text);
 }
 
 .panel button {
@@ -104,6 +180,7 @@ body {
 
 .primitiveToggle {
   display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 8px;
   margin-top: 6px;
 }
@@ -212,11 +289,8 @@ body {
   align-items: center;
   justify-items: start;
   min-height: 0;
-  height: 500px;
-  max-height: 500px;
   padding: 12px;
   box-sizing: border-box;
-  overflow: hidden;
   background: var(--bg);
 }
 
@@ -230,6 +304,35 @@ canvas {
   border-radius: 16px;
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.02);
+}
+
+.certificatesBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: rgba(80, 200, 120, 0.08);
+  border-top: 1px solid rgba(80, 200, 120, 0.25);
+  border-bottom: 1px solid rgba(80, 200, 120, 0.25);
+}
+
+.certificatesLabel {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgba(80, 200, 120, 0.9);
+}
+
+.certBadge {
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 4px 10px;
+  background: rgba(80, 200, 120, 0.15);
+  border: 1px solid rgba(80, 200, 120, 0.3);
+  border-radius: 6px;
+  color: #8de0a6;
 }
 
 .chartsPanel {

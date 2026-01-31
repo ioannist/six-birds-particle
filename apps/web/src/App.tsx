@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { SimWorkerClient } from "./sim/workerClient";
 import {
   addSnapshot,
@@ -10,6 +10,57 @@ import {
 import { SNAPSHOT_VERSION } from "./sim/workerMessages";
 import type { Diagnostics, EnergyBreakdown, SimParams } from "./sim/workerMessages";
 import { PRESET_CATALOG, type PresetEntry } from "./sim/presetCatalog";
+
+const SETTINGS_KEY = "six-birds-settings";
+
+interface SavedSettings {
+  n: number;
+  seed: number;
+  bondThreshold: number;
+  bondsMode: "live" | "chart" | "off";
+  graphStatsMode: "auto" | "ondemand" | "off";
+  stackMaxLayers: number;
+  historyCap: number;
+  recordEverySteps: number;
+  p1Enabled: boolean;
+  p2Enabled: boolean;
+  p3Enabled: boolean;
+  p4Enabled: boolean;
+  p5Enabled: boolean;
+  p6Enabled: boolean;
+  safeThreshold: number;
+  colorSource: "none" | "p4" | "p2";
+  overlayChannel: "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW";
+  presetId: string;
+}
+
+function loadSettings(): Partial<SavedSettings> {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      return JSON.parse(raw);
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return {};
+}
+
+function saveSettings(settings: SavedSettings): void {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearSettings(): void {
+  try {
+    localStorage.removeItem(SETTINGS_KEY);
+  } catch {
+    // ignore
+  }
+}
 
 // Create worker as module-level singleton to avoid React StrictMode double-creation
 let sharedClient: SimWorkerClient | null = null;
@@ -527,7 +578,10 @@ const DEFAULT_PRESET_ID = "base_null_balanced";
 
 function pushHistory(series: number[], value: number, cap: number) {
   series.push(value);
-  while (series.length > cap) series.shift();
+  // cap <= 0 means unlimited
+  if (cap > 0) {
+    while (series.length > cap) series.shift();
+  }
 }
 
 function mean(values: number[]): number {
@@ -1101,18 +1155,22 @@ const DEFAULT_PARAMS: SimParams = {
 };
 
 export default function App() {
-  const [n, setN] = useState(200);
-  const [seed, setSeed] = useState(1);
-  const [bondThreshold, setBondThreshold] = useState(3);
+  // Load saved settings once on mount
+  const [savedSettings] = useState(() => loadSettings());
+
+  const [n, setN] = useState(savedSettings.n ?? 200);
+  const [seed, setSeed] = useState(savedSettings.seed ?? 1);
+  const [bondThreshold, setBondThreshold] = useState(savedSettings.bondThreshold ?? 3);
+  const [showHelp, setShowHelp] = useState(false);
   const [energy, setEnergy] = useState<EnergyBreakdown | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [graphStats, setGraphStats] = useState<GraphStats | null>(null);
   const [graphStatsN, setGraphStatsN] = useState<number | null>(null);
-  const [bondsMode, setBondsMode] = useState<"live" | "chart" | "off">("live");
-  const [graphStatsMode, setGraphStatsMode] = useState<"auto" | "ondemand" | "off">("auto");
-  const [stackMaxLayers, setStackMaxLayers] = useState(DEFAULT_STACK_MAX_LAYERS);
-  const [historyCap, setHistoryCap] = useState(DEFAULT_HISTORY_CAP);
-  const [recordEverySteps, setRecordEverySteps] = useState(2000);
+  const [bondsMode, setBondsMode] = useState<"live" | "chart" | "off">(savedSettings.bondsMode ?? "live");
+  const [graphStatsMode, setGraphStatsMode] = useState<"auto" | "ondemand" | "off">(savedSettings.graphStatsMode ?? "auto");
+  const [stackMaxLayers, setStackMaxLayers] = useState(savedSettings.stackMaxLayers ?? DEFAULT_STACK_MAX_LAYERS);
+  const [historyCap, setHistoryCap] = useState(savedSettings.historyCap ?? DEFAULT_HISTORY_CAP);
+  const [recordEverySteps, setRecordEverySteps] = useState(savedSettings.recordEverySteps ?? 2000);
   const [totalSteps, setTotalSteps] = useState(0);
   const [epExactTotal, setEpExactTotal] = useState<number | null>(null);
   const [epNaiveTotal, setEpNaiveTotal] = useState<number | null>(null);
@@ -1187,17 +1245,17 @@ export default function App() {
     opkBudget: false,
     codeMaint: false,
   });
-  const [p1Enabled, setP1Enabled] = useState(true);
-  const [p2Enabled, setP2Enabled] = useState(true);
-  const [p4Enabled, setP4Enabled] = useState(true);
-  const [p5Enabled, setP5Enabled] = useState(true);
-  const [p3Enabled, setP3Enabled] = useState(false);
-  const [p6Enabled, setP6Enabled] = useState(false);
-  const [safeThreshold, setSafeThreshold] = useState(3);
-  const [colorSource, setColorSource] = useState<"none" | "p4" | "p2">("p4");
+  const [p1Enabled, setP1Enabled] = useState(savedSettings.p1Enabled ?? true);
+  const [p2Enabled, setP2Enabled] = useState(savedSettings.p2Enabled ?? true);
+  const [p4Enabled, setP4Enabled] = useState(savedSettings.p4Enabled ?? true);
+  const [p5Enabled, setP5Enabled] = useState(savedSettings.p5Enabled ?? true);
+  const [p3Enabled, setP3Enabled] = useState(savedSettings.p3Enabled ?? false);
+  const [p6Enabled, setP6Enabled] = useState(savedSettings.p6Enabled ?? false);
+  const [safeThreshold, setSafeThreshold] = useState(savedSettings.safeThreshold ?? 3);
+  const [colorSource, setColorSource] = useState<"none" | "p4" | "p2">(savedSettings.colorSource ?? "p4");
   const [overlayChannel, setOverlayChannel] = useState<
     "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW"
-  >("none");
+  >(savedSettings.overlayChannel ?? "none");
   const [overlayLayerIndex, setOverlayLayerIndex] = useState(0);
   const [status, setStatus] = useState<"idle" | "initializing" | "ready" | "running">("idle");
   const [error, setError] = useState<string | null>(null);
@@ -1205,7 +1263,7 @@ export default function App() {
   const [metaSnapshot, setMetaSnapshot] = useState<{ layers: number; length: number } | null>(null);
   const [paramsDraft, setParamsDraft] = useState<SimParams>(DEFAULT_PARAMS);
   const [paramsApplied, setParamsApplied] = useState<SimParams>(DEFAULT_PARAMS);
-  const [presetId, setPresetId] = useState<string>(DEFAULT_PRESET_ID);
+  const [presetId, setPresetId] = useState<string>(savedSettings.presetId ?? DEFAULT_PRESET_ID);
   const [expandedPanels, setExpandedPanels] = useState<Record<string, boolean>>({
     motion: false,
     p1: false,
@@ -1303,6 +1361,40 @@ export default function App() {
   const metaLayerCount = metaSnapshot?.layers ?? 0;
   const selectedPreset =
     PRESET_CATALOG.find((entry) => entry.id === presetId) ?? PRESET_CATALOG[0] ?? null;
+
+  // Save settings to localStorage when they change
+  useEffect(() => {
+    saveSettings({
+      n,
+      seed,
+      bondThreshold,
+      bondsMode,
+      graphStatsMode,
+      stackMaxLayers,
+      historyCap,
+      recordEverySteps,
+      p1Enabled,
+      p2Enabled,
+      p3Enabled,
+      p4Enabled,
+      p5Enabled,
+      p6Enabled,
+      safeThreshold,
+      colorSource,
+      overlayChannel,
+      presetId,
+    });
+  }, [
+    n, seed, bondThreshold, bondsMode, graphStatsMode, stackMaxLayers,
+    historyCap, recordEverySteps, p1Enabled, p2Enabled, p3Enabled,
+    p4Enabled, p5Enabled, p6Enabled, safeThreshold, colorSource,
+    overlayChannel, presetId,
+  ]);
+
+  const handleResetSettings = useCallback(() => {
+    clearSettings();
+    window.location.reload();
+  }, []);
   const resolveBondsEverySteps = (
     mode: "live" | "chart" | "off" = bondsMode,
     steps = recordEverySteps
@@ -2256,6 +2348,8 @@ export default function App() {
   }, [bondsMode]);
 
   useEffect(() => {
+    // Skip truncation if unlimited (cap <= 0)
+    if (historyCap <= 0) return;
     const cap = Math.max(50, Math.floor(historyCap));
     const history = historyRef.current;
     for (const series of Object.values(history)) {
@@ -2583,11 +2677,37 @@ export default function App() {
   return (
     <div className="app">
       <div className="panel">
-        <h1>Ratchet Playground</h1>
-        <p>
-          Scaffold UI: worker + WASM sim core. Next: implement null-regime detailed balance kernels
-          and Deliverable D diagnostics.
-        </p>
+        <div className="titleRow">
+          <h1>Six Birds Playground</h1>
+          <div className="titleActions">
+            <button
+              type="button"
+              className="helpBtn"
+              onClick={() => setShowHelp((prev) => !prev)}
+              title="How to get started"
+              aria-label="How to get started"
+            >
+              ?
+            </button>
+            <button
+              type="button"
+              className="resetBtn"
+              onClick={handleResetSettings}
+              title="Reset all settings to defaults"
+            >
+              Reset
+            </button>
+          </div>
+        </div>
+        {showHelp ? (
+          <div className="helpBox">
+            <div className="helpTitle">Getting started</div>
+            <div>1) Click Init, wait for Status: ready</div>
+            <div>2) Pick a preset (optional)</div>
+            <div>3) Click Run (or Step)</div>
+            <div>Tip: Apply params after manual edits</div>
+          </div>
+        ) : null}
 
         <div className="row">
           <div>
@@ -2710,16 +2830,6 @@ export default function App() {
               <label>
                 <input
                   type="checkbox"
-                  checked={p6Enabled}
-                  onChange={(e) => setP6Enabled(e.target.checked)}
-                  disabled={status === "initializing"}
-                />
-                <span className="legendSwatch legendSwatch--P6" aria-hidden />
-                <span className="primitiveLabel">P6 resource</span>
-              </label>
-              <label>
-                <input
-                  type="checkbox"
                   checked={p4Enabled}
                   onChange={(e) => setP4Enabled(e.target.checked)}
                   disabled={status === "initializing"}
@@ -2736,6 +2846,16 @@ export default function App() {
                 />
                 <span className="legendSwatch legendSwatch--P5" aria-hidden />
                 <span className="primitiveLabel">P5 field</span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={p6Enabled}
+                  onChange={(e) => setP6Enabled(e.target.checked)}
+                  disabled={status === "initializing"}
+                />
+                <span className="legendSwatch legendSwatch--P6" aria-hidden />
+                <span className="primitiveLabel">P6 resource</span>
               </label>
             </div>
           </div>
@@ -2848,122 +2968,114 @@ export default function App() {
             </div>
             <div>
               <label>History points kept</label>
-              <input
-                type="number"
-                min={50}
-                max={5000}
-                step={1}
+              <select
                 value={historyCap}
                 onChange={(e) => {
-                  const v = Math.max(50, Math.min(5000, Math.floor(Number(e.target.value))));
-                  setHistoryCap(v);
+                  setHistoryCap(Number(e.target.value));
                 }}
                 disabled={status === "initializing"}
-              />
+              >
+                <option value={200}>200</option>
+                <option value={400}>400</option>
+                <option value={800}>800</option>
+                <option value={1600}>1600</option>
+                <option value={4000}>4000</option>
+                <option value={0}>Unlimited ⚠️</option>
+              </select>
             </div>
           </div>
         </div>
 
-        <div className="row twoCol">
-          <div>
-            <label>Overlay channel</label>
-            <select
-              value={overlayChannel}
-              onChange={(e) =>
-                setOverlayChannel(
-                  e.target.value as "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW"
-                )
+        <div style={{ marginBottom: 10 }}>
+          <label>Overlay channel</label>
+          <select
+            value={overlayChannel}
+            onChange={(e) =>
+              setOverlayChannel(
+                e.target.value as "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW"
+              )
+            }
+            disabled={status === "initializing"}
+          >
+            <option value="none">None</option>
+            <option value="baseS">Base S</option>
+            <option value="metaS" disabled={metaLayerCount === 0}>
+              Meta S
+            </option>
+            <option value="metaN" disabled={metaLayerCount === 0}>
+              Meta N
+            </option>
+            <option value="metaA" disabled={metaLayerCount === 0}>
+              Meta A
+            </option>
+            <option value="metaW" disabled={metaLayerCount === 0}>
+              Meta W
+            </option>
+          </select>
+        </div>
+
+        <div style={{ marginBottom: 10 }}>
+          <label>Preset</label>
+          <select
+            value={presetId}
+            onChange={(e) => {
+              const nextId = e.target.value;
+              setPresetId(nextId);
+              const entry = PRESET_CATALOG.find((item) => item.id === nextId);
+              if (entry) {
+                applyPreset(entry);
               }
-              disabled={status === "initializing"}
-            >
-              <option value="none">None</option>
-              <option value="baseS">Base S</option>
-              <option value="metaS" disabled={metaLayerCount === 0}>
-                Meta S
-              </option>
-              <option value="metaN" disabled={metaLayerCount === 0}>
-                Meta N
-              </option>
-              <option value="metaA" disabled={metaLayerCount === 0}>
-                Meta A
-              </option>
-              <option value="metaW" disabled={metaLayerCount === 0}>
-                Meta W
-              </option>
-            </select>
-          </div>
-          <div>
-            <label>Preset</label>
-            <select
-              value={presetId}
-              onChange={(e) => {
-                const nextId = e.target.value;
-                setPresetId(nextId);
-                const entry = PRESET_CATALOG.find((item) => item.id === nextId);
-                if (entry) {
-                  applyPreset(entry);
-                }
-              }}
-              disabled={status === "idle" || status === "initializing"}
-              style={{
-                width: "100%",
-                boxSizing: "border-box",
-                padding: "8px 10px",
-                borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.04)",
-                color: "var(--text)",
-              }}
-            >
-              {Object.entries(presetGroups).map(([group, entries]) => (
-                <optgroup label={group} key={group}>
-                  {entries.map((entry) => (
-                    <option value={entry.id} key={entry.id}>
-                      {entry.label}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            {selectedPreset?.supports && selectedPreset.supports.length > 0 ? (
-              <p style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
-                Supports: {selectedPreset.supports.join(", ")}
-              </p>
-            ) : null}
-            {selectedPreset ? (
-              <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
-                Source: {selectedPreset.sourcePath}
-              </p>
-            ) : null}
-            <p
-              style={{
-                marginTop: 6,
-                fontSize: 12,
-                color: "var(--muted)",
-                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-              }}
-            >
-              Active primitives:{" "}
-              <span style={{ color: activePrimitives.p1 ? "#8de0c6" : "#ff9aa2" }}>
-                P1{activePrimitives.p1 ? "✅" : "❌"}
-              </span>{" "}
-              <span style={{ color: activePrimitives.p2 ? "#8de0c6" : "#ff9aa2" }}>
-                P2{activePrimitives.p2 ? "✅" : "❌"}
-              </span>{" "}
-              <span style={{ color: activePrimitives.p3 ? "#8de0c6" : "#ff9aa2" }}>
-                P3{activePrimitives.p3 ? "✅" : "❌"}
-              </span>{" "}
-              <span style={{ color: activePrimitives.p4 ? "#8de0c6" : "#ff9aa2" }}>
-                P4{activePrimitives.p4 ? "✅" : "❌"}
-              </span>{" "}
-              <span style={{ color: activePrimitives.p5 ? "#8de0c6" : "#ff9aa2" }}>
-                P5{activePrimitives.p5 ? "✅" : "❌"}
-              </span>{" "}
-              <span style={{ color: activePrimitives.p6 ? "#8de0c6" : "#ff9aa2" }}>
-                P6{activePrimitives.p6 ? "✅" : "❌"}
-              </span>
+            }}
+            disabled={status === "idle" || status === "initializing"}
+          >
+            {Object.entries(presetGroups).map(([group, entries]) => (
+              <optgroup label={group} key={group}>
+                {entries.map((entry) => (
+                  <option value={entry.id} key={entry.id}>
+                    {entry.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+          {selectedPreset?.supports && selectedPreset.supports.length > 0 ? (
+            <p style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
+              Supports: {selectedPreset.supports.join(", ")}
             </p>
-          </div>
+          ) : null}
+          {selectedPreset ? (
+            <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+              Source: {selectedPreset.sourcePath}
+            </p>
+          ) : null}
+          <p
+            style={{
+              marginTop: 6,
+              fontSize: 12,
+              color: "var(--muted)",
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            }}
+          >
+            Active primitives:{" "}
+            <span style={{ color: activePrimitives.p1 ? "#8de0c6" : "#ff9aa2" }}>
+              P1{activePrimitives.p1 ? "✅" : "❌"}
+            </span>{" "}
+            <span style={{ color: activePrimitives.p2 ? "#8de0c6" : "#ff9aa2" }}>
+              P2{activePrimitives.p2 ? "✅" : "❌"}
+            </span>{" "}
+            <span style={{ color: activePrimitives.p3 ? "#8de0c6" : "#ff9aa2" }}>
+              P3{activePrimitives.p3 ? "✅" : "❌"}
+            </span>{" "}
+            <span style={{ color: activePrimitives.p4 ? "#8de0c6" : "#ff9aa2" }}>
+              P4{activePrimitives.p4 ? "✅" : "❌"}
+            </span>{" "}
+            <span style={{ color: activePrimitives.p5 ? "#8de0c6" : "#ff9aa2" }}>
+              P5{activePrimitives.p5 ? "✅" : "❌"}
+            </span>{" "}
+            <span style={{ color: activePrimitives.p6 ? "#8de0c6" : "#ff9aa2" }}>
+              P6{activePrimitives.p6 ? "✅" : "❌"}
+            </span>
+          </p>
         </div>
 
         {overlayChannel.startsWith("meta") ? (
@@ -3916,54 +4028,6 @@ export default function App() {
             </p>
           </div>
         ) : null}
-        {certPassed.epNull ||
-        certPassed.sigmaNull ||
-        certPassed.m6Null ||
-        certPassed.clockNull ||
-        certPassed.tur ||
-        certPassed.opkBudget ||
-        certPassed.codeMaint ? (
-          <div style={{ marginTop: 8 }}>
-            <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-              Certificates
-            </p>
-            {certPassed.epNull ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ Null EP exact rate ~ 0
-              </p>
-            ) : null}
-            {certPassed.sigmaNull ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ Null Σmem ~ 0
-              </p>
-            ) : null}
-            {certPassed.m6Null ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ Null M6 motifs ~ 0
-              </p>
-            ) : null}
-            {certPassed.clockNull ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ Null clock drift ~ 0
-              </p>
-            ) : null}
-            {certPassed.tur ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ TUR ratio R ≥ 1 (estimate)
-              </p>
-            ) : null}
-            {certPassed.opkBudget ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ opK budget conserved
-              </p>
-            ) : null}
-            {certPassed.codeMaint ? (
-              <p style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                ✅ Code maintenance: low error with EP&gt;0
-              </p>
-            ) : null}
-          </div>
-        ) : null}
         <p style={{ marginTop: 6, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
           Meta layers {paramsApplied.metaLayers} | metaField.length {metaSnapshot ? metaSnapshot.length : 0}
         </p>
@@ -4112,6 +4176,26 @@ export default function App() {
             </div>
           ) : null}
         </div>
+
+        {(certPassed.epNull ||
+          certPassed.sigmaNull ||
+          certPassed.m6Null ||
+          certPassed.clockNull ||
+          certPassed.tur ||
+          certPassed.opkBudget ||
+          certPassed.codeMaint) && (
+          <div className="certificatesBar">
+            <span className="certificatesLabel">Certificates:</span>
+            {certPassed.epNull && <span className="certBadge">✅ Null EP</span>}
+            {certPassed.sigmaNull && <span className="certBadge">✅ Null Σmem</span>}
+            {certPassed.m6Null && <span className="certBadge">✅ Null M6</span>}
+            {certPassed.clockNull && <span className="certBadge">✅ Null Clock</span>}
+            {certPassed.tur && <span className="certBadge">✅ TUR R≥1</span>}
+            {certPassed.opkBudget && <span className="certBadge">✅ opK Budget</span>}
+            {certPassed.codeMaint && <span className="certBadge">✅ Code Maint</span>}
+          </div>
+        )}
+
         <div className="chartsPanel">
           {metaLayerCount >= 2 && metaAlignCurrent ? (
             <div className="metaAlignSection">
