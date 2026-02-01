@@ -64,6 +64,9 @@ nvm install --lts
 
 ## Getting started
 
+Want to run the web app without local setup? Use the hosted build:
+https://sixbirds.automorph.io/
+
 From the repo root:
 
 ```bash
