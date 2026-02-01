@@ -1,0 +1,15 @@
+{
+  "name": "sim-core",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "sim_core_bg.wasm",
+    "sim_core.js",
+    "sim_core.d.ts"
+  ],
+  "main": "sim_core.js",
+  "types": "sim_core.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

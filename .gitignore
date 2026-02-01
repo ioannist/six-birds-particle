@@ -6,7 +6,6 @@ dist/
 # Rust / WASM build outputs
 target/
 crates/**/pkg/
-apps/web/src/wasm/sim_core/
 
 # Logs
 npm-debug.log*
