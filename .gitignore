@@ -15,3 +15,4 @@ yarn-error.log*
 # Repo snapshots
 *_snapshot_v*.zip
 .package-repo-snapshot-version
+.vercel

@@ -10,6 +10,11 @@ import {
 import { SNAPSHOT_VERSION } from "./sim/workerMessages";
 import type { Diagnostics, EnergyBreakdown, SimParams } from "./sim/workerMessages";
 import { PRESET_CATALOG, type PresetEntry } from "./sim/presetCatalog";
+import {
+  drawEvidenceOverlays,
+  type EvidenceEnv,
+  type EvidenceOverlayTarget,
+} from "./overlays/evidenceOverlays";
 
 const SETTINGS_KEY = "six-birds-settings";
 
@@ -32,6 +37,7 @@ interface SavedSettings {
   colorSource: "none" | "p4" | "p2";
   overlayChannel: "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW";
   presetId: string;
+  evidenceOverlaysOn: boolean;
 }
 
 function loadSettings(): Partial<SavedSettings> {
@@ -567,6 +573,8 @@ const MAINT_EVERY_STEPS = 50000;
 const MAINT_TRIALS = 8;
 const MAINT_ERR_FRAC = 0.5;
 const MAINT_SERIES_CAP = 240;
+/** Threshold for "bad cell" in maintenance overlay: |base - meta0| > tau */
+const MAINT_BAD_CELL_TAU = 3;
 const SSTACK_STATS_EVERY_STEPS = 20000;
 const MOVE_P5_BASE = 7;
 const MOVE_P5_META = 8;
@@ -1256,6 +1264,9 @@ export default function App() {
   const [overlayChannel, setOverlayChannel] = useState<
     "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW"
   >(savedSettings.overlayChannel ?? "none");
+  const [evidenceOverlaysOn, setEvidenceOverlaysOn] = useState(
+    savedSettings.evidenceOverlaysOn ?? true
+  );
   const [overlayLayerIndex, setOverlayLayerIndex] = useState(0);
   const [status, setStatus] = useState<"idle" | "initializing" | "ready" | "running">("idle");
   const [error, setError] = useState<string | null>(null);
@@ -1314,7 +1325,13 @@ export default function App() {
     offsetPairs: [] as Array<[number, number]>,
   });
   const opkMetaRef = useRef<typeof opkMeta>(null);
-  const opkFieldRef = useRef({
+  const opkFieldRef = useRef<{
+    baseS: Uint8Array<ArrayBufferLike>;
+    metaS: Uint8Array<ArrayBufferLike>;
+    grid: number;
+    lS: number;
+    metaLayers: number;
+  }>({
     baseS: new Uint8Array(),
     metaS: new Uint8Array(),
     grid: 0,
@@ -1339,6 +1356,11 @@ export default function App() {
     baselineSdiff: null as number | null,
     recoverySteps: null as number | null,
     seed: 1234567,
+    // Evidence overlay: bad cells for maintenance cert
+    badCells: 0,
+    badCellIdx: new Uint32Array(0),
+    badTau: MAINT_BAD_CELL_TAU,
+    errF0_5: null as number | null,
   });
   const metaAlignHistoryRef = useRef({
     sdiffBase: [] as number[],
@@ -1383,17 +1405,39 @@ export default function App() {
       colorSource,
       overlayChannel,
       presetId,
+      evidenceOverlaysOn,
     });
   }, [
     n, seed, bondThreshold, bondsMode, graphStatsMode, stackMaxLayers,
     historyCap, recordEverySteps, p1Enabled, p2Enabled, p3Enabled,
     p4Enabled, p5Enabled, p6Enabled, safeThreshold, colorSource,
-    overlayChannel, presetId,
+    overlayChannel, presetId, evidenceOverlaysOn,
   ]);
 
   const handleResetSettings = useCallback(() => {
     clearSettings();
-    window.location.reload();
+    // Reset all state to defaults instead of reloading the page
+    setN(200);
+    setSeed(1);
+    setBondThreshold(3);
+    setBondsMode("live");
+    setGraphStatsMode("auto");
+    setStackMaxLayers(DEFAULT_STACK_MAX_LAYERS);
+    setHistoryCap(DEFAULT_HISTORY_CAP);
+    setRecordEverySteps(2000);
+    setP1Enabled(true);
+    setP2Enabled(true);
+    setP3Enabled(false);
+    setP4Enabled(true);
+    setP5Enabled(true);
+    setP6Enabled(false);
+    setSafeThreshold(3);
+    setColorSource("p4");
+    setOverlayChannel("none");
+    setEvidenceOverlaysOn(true);
+    setPresetId(DEFAULT_PRESET_ID);
+    setParamsDraft(DEFAULT_PARAMS);
+    setParamsApplied(DEFAULT_PARAMS);
   }, []);
   const resolveBondsEverySteps = (
     mode: "live" | "chart" | "off" = bondsMode,
@@ -1561,9 +1605,9 @@ export default function App() {
           const oldest = points[0]!;
           const dt = stepNow - oldest.step;
           if (dt > 0) {
-            exactRate = (epExtras.exactTotal - oldest.exact) / dt;
-            if (typeof epExtras?.naiveTotal === "number") {
-              naiveRate = (epExtras.naiveTotal - oldest.naive) / dt;
+            exactRate = (epExactTotalNow - oldest.exact) / dt;
+            if (typeof epNaiveTotalNow === "number") {
+              naiveRate = (epNaiveTotalNow - oldest.naive) / dt;
             }
           }
         }
@@ -1745,6 +1789,25 @@ export default function App() {
           const baseCanvas = sStackRefs.current["sstack_base"];
           if (baseCanvas) {
             drawFieldHeatmap(baseCanvas, baseField, grid, paramsApplied.lS);
+            // Draw evidence overlays on sStack base canvas
+            if (evidenceOverlaysOn) {
+              const maint = maintRef.current;
+              const evidenceEnv: EvidenceEnv = {
+                gridSize: grid,
+                totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+                certPassed,
+                canvasWidth: baseCanvas.width,
+                canvasHeight: baseCanvas.height,
+                maintenance: {
+                  errF0_5: maint.errF0_5,
+                  badCells: maint.badCells,
+                  tau: maint.badTau,
+                  badCellIdx: maint.badCellIdx,
+                },
+                context: { sStackMode: "layers" },
+              };
+              drawEvidenceOverlays("sStackBase", baseCanvas, evidenceEnv);
+            }
           }
           if (addStats) addStats("sstack_base", "Base", baseField);
           if (shouldUpdateSStackStats) {
@@ -1758,6 +1821,24 @@ export default function App() {
             const canvas = sStackRefs.current[id];
             if (canvas) {
               drawFieldHeatmap(canvas, metaField, grid, paramsApplied.lS);
+              // Draw evidence overlays on meta layer canvas (only for meta0)
+              if (evidenceOverlaysOn && layerIndex === 0) {
+                const maint = maintRef.current;
+                const evidenceEnv: EvidenceEnv = {
+                  gridSize: grid,
+                  totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+                  certPassed,
+                  canvasWidth: canvas.width,
+                  canvasHeight: canvas.height,
+                  maintenance: {
+                    errF0_5: maint.errF0_5,
+                    badCells: maint.badCells,
+                    tau: maint.badTau,
+                  },
+                  context: { sStackMode: "layers", sStackLayerIndex: layerIndex },
+                };
+                drawEvidenceOverlays("sStackMeta:0", canvas, evidenceEnv);
+              }
             }
             if (addStats) addStats(id, `Meta ${layerIndex}`, metaField);
           }
@@ -1766,17 +1847,76 @@ export default function App() {
           const baseCanvas = sStackRefs.current["sstack_base"];
           if (baseCanvas) {
             drawFieldHeatmap(baseCanvas, baseField, grid, paramsApplied.lS);
+            // Draw evidence overlays on sStack base canvas
+            if (evidenceOverlaysOn) {
+              const maint = maintRef.current;
+              const evidenceEnv: EvidenceEnv = {
+                gridSize: grid,
+                totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+                certPassed,
+                canvasWidth: baseCanvas.width,
+                canvasHeight: baseCanvas.height,
+                maintenance: {
+                  errF0_5: maint.errF0_5,
+                  badCells: maint.badCells,
+                  tau: maint.badTau,
+                  badCellIdx: maint.badCellIdx,
+                },
+                context: { sStackMode: "diff_base" },
+              };
+              drawEvidenceOverlays("sStackBase", baseCanvas, evidenceEnv);
+            }
           }
           if (addStats) addStats("sstack_base", "Base", baseField);
           if (meta0) {
             const metaCanvas = sStackRefs.current["sstack_meta_0"];
             if (metaCanvas) {
               drawFieldHeatmap(metaCanvas, meta0, grid, paramsApplied.lS);
+              // Draw evidence overlays on meta0 canvas
+              if (evidenceOverlaysOn) {
+                const maint = maintRef.current;
+                const evidenceEnv: EvidenceEnv = {
+                  gridSize: grid,
+                  totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+                  certPassed,
+                  canvasWidth: metaCanvas.width,
+                  canvasHeight: metaCanvas.height,
+                  maintenance: {
+                    errF0_5: maint.errF0_5,
+                    badCells: maint.badCells,
+                    tau: maint.badTau,
+                  },
+                  context: { sStackMode: "diff_base" },
+                };
+                drawEvidenceOverlays("sStackMeta:0", metaCanvas, evidenceEnv);
+              }
             }
             if (addStats) addStats("sstack_meta_0", "Meta 0", meta0);
             const diffCanvas = sStackRefs.current["sstack_diff_base0"];
             if (diffCanvas) {
               drawFieldAbsDiffHeatmap(diffCanvas, baseField, meta0, grid, paramsApplied.lS);
+              // Draw evidence overlays on sStack diff canvas
+              if (evidenceOverlaysOn) {
+                const maint = maintRef.current;
+                const evidenceEnv: EvidenceEnv = {
+                  gridSize: grid,
+                  totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+                  certPassed,
+                  canvasWidth: diffCanvas.width,
+                  canvasHeight: diffCanvas.height,
+                  maintenance: {
+                    errF0_5: maint.errF0_5,
+                    badCells: maint.badCells,
+                    tau: maint.badTau,
+                    badCellIdx: maint.badCellIdx,
+                  },
+                  context: {
+                    sStackMode: "diff_base",
+                    sStackDiffKind: "base0",
+                  },
+                };
+                drawEvidenceOverlays("sStackDiff", diffCanvas, evidenceEnv);
+              }
             }
             if (shouldUpdateSStackStats) {
               nextDiffMean = meanAbsDiff(baseField, meta0, cells);
@@ -1807,6 +1947,28 @@ export default function App() {
             const diffCanvas = sStackRefs.current["sstack_diff_meta_pair"];
             if (diffCanvas) {
               drawFieldAbsDiffHeatmap(diffCanvas, metaA, metaB, grid, paramsApplied.lS);
+              // Draw evidence overlays on sStack diff canvas
+              if (evidenceOverlaysOn) {
+                const maint = maintRef.current;
+                const evidenceEnv: EvidenceEnv = {
+                  gridSize: grid,
+                  totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+                  certPassed,
+                  canvasWidth: diffCanvas.width,
+                  canvasHeight: diffCanvas.height,
+                  maintenance: {
+                    errF0_5: maint.errF0_5,
+                    badCells: maint.badCells,
+                    tau: maint.badTau,
+                    badCellIdx: maint.badCellIdx,
+                  },
+                  context: {
+                    sStackMode: "diff_meta",
+                    sStackDiffKind: "metaPair",
+                  },
+                };
+                drawEvidenceOverlays("sStackDiff", diffCanvas, evidenceEnv);
+              }
             }
             if (shouldUpdateSStackStats) {
               nextDiffMean = meanAbsDiff(metaA, metaB, cells);
@@ -1848,6 +2010,8 @@ export default function App() {
 
         let sdiffBase: number | null = null;
         let errF0_5: number | null = null;
+        let badCellCount = 0;
+        let badCellIdxArr = new Uint32Array(0);
         if (paramsApplied.metaLayers >= 1 && cells > 0 && s.metaField.length >= cells) {
           const meta0 = s.metaField.subarray(0, cells);
           sdiffBase = meanAbsDiff(s.baseSField, meta0, cells);
@@ -1860,7 +2024,23 @@ export default function App() {
             MAINT_ERR_FRAC,
             maint.seed++
           );
+          // Compute bad cells for evidence overlay (cells where |base - meta0| > tau)
+          const tau = MAINT_BAD_CELL_TAU;
+          const badIndices: number[] = [];
+          for (let i = 0; i < cells; i++) {
+            const diff = Math.abs((s.baseSField[i] ?? 0) - (meta0[i] ?? 0));
+            if (diff > tau) {
+              badIndices.push(i);
+            }
+          }
+          badCellCount = badIndices.length;
+          badCellIdxArr = new Uint32Array(badIndices);
         }
+        // Store bad cell data for evidence overlays
+        maint.badCells = badCellCount;
+        maint.badCellIdx = badCellIdxArr;
+        maint.badTau = MAINT_BAD_CELL_TAU;
+        maint.errF0_5 = errF0_5;
 
         let recoverySteps = maint.recoverySteps;
         if (maint.lastPerturbStep !== null && recoverySteps === null) {
@@ -2021,6 +2201,48 @@ export default function App() {
         next.codeMaint !== certPassed.codeMaint
       ) {
         setCertPassed(next);
+      }
+
+      // Draw evidence overlays on main canvas (after cert evaluation for responsiveness)
+      if (evidenceOverlaysOn && canvas) {
+        const maint = maintRef.current;
+        // Compute stamp scalars for non-spatial certs
+        const m6Max = Math.max(
+          Math.abs(s.diagnostics.aM6W),
+          Math.abs(s.diagnostics.aM6N),
+          Math.abs(s.diagnostics.aM6A),
+          Math.abs(s.diagnostics.aM6S),
+        );
+        const stepsTotal = epStepCounterRef.current;
+        const clockDriftNow = clockQ !== null && stepsTotal > 0 ? clockQ / stepsTotal : null;
+
+        const evidenceEnv: EvidenceEnv = {
+          gridSize: grid,
+          totalSteps: totalSteps + (s.steps > 0 ? s.steps : 0),
+          certPassed: next, // Use computed next state for immediate responsiveness
+          canvasWidth: canvas.width,
+          canvasHeight: canvas.height,
+          maintenance: {
+            errF0_5: maint.errF0_5,
+            badCells: maint.badCells,
+            tau: maint.badTau,
+            badCellIdx: maint.badCellIdx,
+          },
+          stamps: {
+            epExactRate: currentEpExactRate,
+            epExactRateMax: CERT_EP_EXACT_RATE_ABS_MAX,
+            sigmaMem: s.diagnostics.sigmaMem,
+            sigmaMemMax: CERT_SIGMA_MEM_ABS_MAX,
+            m6MaxAbs: m6Max,
+            m6MaxAbsMax: CERT_M6_ABS_MAX,
+            clockDrift: clockDriftNow,
+            clockDriftMax: CERT_CLOCK_NULL_DRIFT_ABS_MAX,
+            turR: turStatsNow?.R ?? null,
+            turRMin: CERT_TUR_R_MIN,
+            turRMax: 2.0,
+          },
+        };
+        drawEvidenceOverlays("mainCanvas", canvas, evidenceEnv);
       }
 
       chartStepRef.current += Math.max(0, s.steps);
@@ -2245,6 +2467,7 @@ export default function App() {
     certPassed.tur,
     certPassed.opkBudget,
     certPassed.codeMaint,
+    evidenceOverlaysOn,
   ]);
 
   useEffect(() => {
@@ -2277,6 +2500,10 @@ export default function App() {
         baselineSdiff: null,
         recoverySteps: null,
         seed: 1234567,
+        badCells: 0,
+        badCellIdx: new Uint32Array(0),
+        badTau: MAINT_BAD_CELL_TAU,
+        errF0_5: null,
       };
       metaAlignHistoryRef.current = { sdiffBase: [], sdiffMeta: [], wdiffMeta: [] };
       metaAlignRef.current = null;
@@ -2479,6 +2706,23 @@ export default function App() {
             });
     const maxValue = opkViewMode === "mismatch" ? 255 : budgetK;
     drawFieldHeatmap(canvas, field, grid, maxValue);
+    // Draw evidence overlays on opK heatmap (cadence-driven: only when base redraws)
+    if (evidenceOverlaysOn) {
+      const opkStatsNow = opkStatsRef.current;
+      const evidenceEnv: EvidenceEnv = {
+        gridSize: grid,
+        totalSteps,
+        certPassed,
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+        opk: {
+          badCells: opkStatsNow?.badCells ?? 0,
+          budgetK: meta?.budgetK ?? budgetK,
+          computedAtSteps: meta?.computedAtSteps,
+        },
+      };
+      drawEvidenceOverlays("opkHeatmap", canvas, evidenceEnv);
+    }
 
     const budget = Math.max(1, Math.min(255, budgetK));
     const bins = new Array(budget + 1).fill(0);
@@ -2507,6 +2751,9 @@ export default function App() {
     opkMeta?.rCount,
     opkMeta?.stencilId,
     opkMeta?.computedAtSteps,
+    evidenceOverlaysOn,
+    certPassed,
+    totalSteps,
   ]);
 
   const canInit = status === "idle" || status === "ready";
@@ -2983,6 +3230,16 @@ export default function App() {
                 <option value={0}>Unlimited ⚠️</option>
               </select>
             </div>
+          </div>
+          <div className="row" style={{ marginTop: 8 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={evidenceOverlaysOn}
+                onChange={(e) => setEvidenceOverlaysOn(e.target.checked)}
+              />
+              <span>Evidence overlays</span>
+            </label>
           </div>
         </div>
 

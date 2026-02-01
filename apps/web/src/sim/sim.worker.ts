@@ -6,7 +6,7 @@ let sim: any | null = null;
 let running = false;
 let bondThreshold = 2;
 let bondsEverySteps = 1;
-let cachedBonds: Uint32Array | null = null;
+let cachedBonds: Uint32Array<ArrayBufferLike> | null = null;
 let lastBondsSteps = -1;
 let pendingParams: any | null = null;
 let lastParams: any | null = null;
@@ -51,19 +51,21 @@ function buildSnapshot(
     cachedOpkOffsets = simRef.op_offsets();
     cachedOpkTokens = simRef.op_k_tokens();
     lastOpkPayloadSteps = totalSteps;
-    opkOffsets = cachedOpkOffsets;
-    opkTokens = cachedOpkTokens;
+    opkOffsets = cachedOpkOffsets ?? undefined;
+    opkTokens = cachedOpkTokens ?? undefined;
     opkComputedAt = totalSteps;
   } else if (cachedOpkTokens) {
     opkComputedAt = lastOpkPayloadSteps;
   }
 
-  let bonds = new Uint32Array();
+  let bonds: Uint32Array<ArrayBufferLike> = new Uint32Array();
   if (bondsEverySteps > 0) {
     if (totalSteps === 0 || lastBondsSteps < 0 || totalSteps - lastBondsSteps >= bondsEverySteps) {
       cachedBonds = simRef.bonds(bondLimit);
       lastBondsSteps = totalSteps;
-      bonds = cachedBonds;
+      if (cachedBonds) {
+        bonds = cachedBonds;
+      }
     }
   } else {
     cachedBonds = null;
