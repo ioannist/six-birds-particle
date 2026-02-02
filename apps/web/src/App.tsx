@@ -1431,6 +1431,9 @@ export default function App() {
     baselineSdiff: null as number | null,
     recoverySteps: null as number | null,
     seed: 1234567,
+    injuryPending: false,
+    damageAtInjury: null as number | null,
+    damagePeakSinceInjury: null as number | null,
     // Evidence overlay: bad cells for maintenance cert
     badCells: 0,
     badCellIdx: new Uint32Array(0) as Uint32Array<ArrayBufferLike>,
@@ -1470,6 +1473,7 @@ export default function App() {
     inFlight: boolean;
     awaitingA: boolean;
     awaitingB: boolean;
+    stepInFlight: number;
     totalSteps: number;
     injuryTriggered: boolean;
     paramsA: SimParams | null;
@@ -1487,6 +1491,7 @@ export default function App() {
     inFlight: false,
     awaitingA: false,
     awaitingB: false,
+    stepInFlight: 0,
     totalSteps: 0,
     injuryTriggered: false,
     paramsA: null,
@@ -1520,6 +1525,7 @@ export default function App() {
   const storyMeta = STORY_SCENARIO_META[storyScenarioId];
   const storyPresetEntry =
     PRESET_CATALOG.find((entry) => entry.id === storyMeta.presetId) ?? null;
+  const showCertBar = !(storyPhase === "warming" || storyPhase === "recovering");
 
   // Save settings to localStorage when they change
   useEffect(() => {
@@ -2276,6 +2282,19 @@ export default function App() {
         maint.badCellIdx = badCellIdxArr;
         maint.badTau = MAINT_BAD_CELL_TAU;
         maint.errF0_5 = errF0_5;
+        if (maint.lastPerturbStep !== null) {
+          if (maint.injuryPending) {
+            maint.damageAtInjury = badCellCount;
+            maint.damagePeakSinceInjury = badCellCount;
+            maint.injuryPending = false;
+          } else if (maint.damagePeakSinceInjury !== null) {
+            maint.damagePeakSinceInjury = Math.max(maint.damagePeakSinceInjury, badCellCount);
+          }
+        } else {
+          maint.injuryPending = false;
+          maint.damageAtInjury = null;
+          maint.damagePeakSinceInjury = null;
+        }
 
         let recoverySteps = maint.recoverySteps;
         if (maint.lastPerturbStep !== null && recoverySteps === null) {
@@ -2329,23 +2348,33 @@ export default function App() {
         }
           histories.damage.push(badCellCount);
           if (histories.damage.length > MAINT_SERIES_CAP) histories.damage.shift();
-        const trendWindow = 8;
-        const trendEps = 0.5;
         let trendPerSample: number | null = null;
         let trendLabel = "—";
+        const trendWindow = 8;
         if (histories.damage.length >= trendWindow) {
           const start = histories.damage[histories.damage.length - trendWindow] ?? badCellCount;
           const end = histories.damage[histories.damage.length - 1] ?? badCellCount;
           trendPerSample = (end - start) / (trendWindow - 1);
-          if (trendPerSample < -trendEps) trendLabel = "healing";
-          else if (trendPerSample > trendEps) trendLabel = "worsening";
+        }
+        const peak = maint.damagePeakSinceInjury;
+        if (peak !== null) {
+          const deltaFromPeak = peak - badCellCount;
+          if (deltaFromPeak >= 2) trendLabel = "healing";
+          else if (deltaFromPeak <= -2) trendLabel = "worsening";
           else trendLabel = "stable";
         }
         const damagePct = cells > 0 ? badCellCount / cells : null;
+        const recovered =
+          peak !== null ? Math.max(0, peak - badCellCount) : null;
+        const recoveredPct =
+          peak !== null && peak > 0 ? Math.max(0, (peak - badCellCount) / peak) : null;
         const nextHud: LifeHudState = {
           updatedAtSteps: maintStepNow,
           damageCells: badCellCount,
           damagePct,
+          damagePeak: peak,
+          recovered,
+          recoveredPct,
           trendPerSample,
           trendLabel,
           epExactRate: currentEpExactRate,
@@ -2395,6 +2424,7 @@ export default function App() {
         const canvasA = abDiffARef.current;
         if (canvasA && cells > 0 && s.metaField.length >= cells) {
           const meta0 = s.metaField.subarray(0, cells);
+          const meanDiff = meanAbsDiff(s.baseSField, meta0, cells);
           drawFieldAbsDiffHeatmap(canvasA, s.baseSField, meta0, grid, paramsApplied.lS);
           if (injuryMapOn) {
             const maint = maintRef.current;
@@ -2403,6 +2433,7 @@ export default function App() {
               "Injury map",
               `τ = ${MAINT_BAD_CELL_TAU}`,
               `bad = ${maint.badCells}${damagePct !== null ? ` (${(damagePct * 100).toFixed(1)}%)` : ""}`,
+              `mean|Δ| = ${meanDiff.toFixed(3)}`,
               maint.badCellUpdatedAt ? `@${maint.badCellUpdatedAt}` : "",
             ].filter((line) => line !== "");
             drawInjuryMapOverlay(canvasA.getContext("2d"), grid, maint.badCellIdx, legend);
@@ -2828,6 +2859,9 @@ export default function App() {
         baselineSdiff: null,
         recoverySteps: null,
         seed: 1234567,
+        injuryPending: false,
+        damageAtInjury: null,
+        damagePeakSinceInjury: null,
         badCells: 0,
         badCellIdx: new Uint32Array(0) as Uint32Array<ArrayBufferLike>,
         badTau: MAINT_BAD_CELL_TAU,
@@ -3190,6 +3224,7 @@ export default function App() {
     ab.inFlight = false;
     ab.awaitingA = false;
     ab.awaitingB = false;
+    ab.stepInFlight = 0;
     ab.totalSteps = 0;
     ab.injuryTriggered = false;
     ab.badCellsB = 0;
@@ -3201,17 +3236,24 @@ export default function App() {
     const ab = abRef.current;
     const clientB = clientBRef.current;
     if (!ab.enabled || ab.inFlight || !clientB) return;
+    const story = storyRef.current;
+    const stepsRemaining = story.endAt - ab.totalSteps;
+    if (stepsRemaining <= 0) return;
+    const stepsThis = Math.min(AB_STEP_CHUNK, stepsRemaining);
     ab.inFlight = true;
     ab.awaitingA = true;
     ab.awaitingB = true;
-    client.send({ type: "step", steps: AB_STEP_CHUNK });
-    clientB.send({ type: "step", steps: AB_STEP_CHUNK });
+    ab.stepInFlight = stepsThis;
+    client.send({ type: "step", steps: stepsThis });
+    clientB.send({ type: "step", steps: stepsThis });
   };
   const maybeAdvanceAb = () => {
     const ab = abRef.current;
     if (!ab.enabled || !ab.inFlight || ab.awaitingA || ab.awaitingB) return;
     ab.inFlight = false;
-    ab.totalSteps += AB_STEP_CHUNK;
+    const stepsThis = ab.stepInFlight > 0 ? ab.stepInFlight : AB_STEP_CHUNK;
+    ab.stepInFlight = 0;
+    ab.totalSteps += stepsThis;
     const story = storyRef.current;
     const scenario = STORY_SCENARIOS[story.scenarioId];
     if (!ab.injuryTriggered && ab.totalSteps >= story.injuryAt) {
@@ -3323,6 +3365,7 @@ export default function App() {
       const canvas = abDiffBRef.current;
       if (canvas && cells > 0 && s.metaField.length >= cells) {
         const meta0 = s.metaField.subarray(0, cells);
+        const meanDiff = meanAbsDiff(s.baseSField, meta0, cells);
         drawFieldAbsDiffHeatmap(canvas, s.baseSField, meta0, grid, paramsB.lS);
         if (injuryMapOnRef.current) {
           const damagePct = cells > 0 ? ab.badCellsB / cells : null;
@@ -3330,6 +3373,7 @@ export default function App() {
             "Injury map",
             `τ = ${MAINT_BAD_CELL_TAU}`,
             `bad = ${ab.badCellsB}${damagePct !== null ? ` (${(damagePct * 100).toFixed(1)}%)` : ""}`,
+            `mean|Δ| = ${meanDiff.toFixed(3)}`,
             ab.badCellUpdatedAtB ? `@${ab.badCellUpdatedAtB}` : "",
           ].filter((line) => line !== "");
           drawInjuryMapOverlay(canvas.getContext("2d"), grid, ab.badCellIdxB, legend);
@@ -3354,6 +3398,9 @@ export default function App() {
     maintRef.current.recoverySteps = null;
     maintRef.current.baselineErr = maintStats?.errF0_5 ?? null;
     maintRef.current.baselineSdiff = maintStats?.sdiffBase ?? null;
+    maintRef.current.injuryPending = true;
+    maintRef.current.damageAtInjury = null;
+    maintRef.current.damagePeakSinceInjury = null;
     maintForceComputeRef.current = true;
     if (maintStats) {
       setMaintStats({
@@ -4132,6 +4179,11 @@ export default function App() {
               </label>
             ) : null}
           </div>
+          {compareOn && storyScenarioId === "injury_healing" && compareControl === "no_eta" ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
+              Tip: η=0 is a weak control for healing; try No repair (P5 off) or No P6 for clearer contrast.
+            </div>
+          ) : null}
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
             <button
               type="button"
@@ -5274,13 +5326,14 @@ export default function App() {
           ) : null}
         </div>
 
-        {(certPassed.epNull ||
-          certPassed.sigmaNull ||
-          certPassed.m6Null ||
-          certPassed.clockNull ||
-          certPassed.tur ||
-          certPassed.opkBudget ||
-          certPassed.codeMaint) && (
+        {showCertBar &&
+          (certPassed.epNull ||
+            certPassed.sigmaNull ||
+            certPassed.m6Null ||
+            certPassed.clockNull ||
+            certPassed.tur ||
+            certPassed.opkBudget ||
+            certPassed.codeMaint) && (
           <div className="certificatesBar">
             <span className="certificatesLabel">Certificates:</span>
             {certPassed.epNull && <span className="certBadge">✅ Null EP</span>}

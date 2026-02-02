@@ -654,6 +654,9 @@ export type LifeHudState = {
   updatedAtSteps: number;
   damageCells: number | null;
   damagePct: number | null;
+  damagePeak: number | null;
+  recovered: number | null;
+  recoveredPct: number | null;
   trendPerSample: number | null;
   trendLabel: string;
   epExactRate: number | null;
@@ -682,6 +685,13 @@ export function drawLifeHud(ctx: CanvasRenderingContext2D, hud: LifeHudState): v
         }`
       : "Damage: —";
 
+  const recoveredLabel =
+    hud.damagePeak !== null && hud.damageCells !== null
+      ? `Recovered: ${hud.damagePeak} → ${hud.damageCells}${
+          hud.recoveredPct !== null ? ` (${Math.round(hud.recoveredPct * 100)}%)` : ""
+        }`
+      : "Recovered: —";
+
   let trendSymbol = "—";
   if (hud.trendLabel === "healing") trendSymbol = "↓";
   if (hud.trendLabel === "worsening") trendSymbol = "↑";
@@ -693,7 +703,7 @@ export function drawLifeHud(ctx: CanvasRenderingContext2D, hud: LifeHudState): v
   const repairText = formatHudValue(hud.epRepairRate);
   const costLine = `Cost: EP ${epText} | Repair ${repairText}`;
 
-  const lines = [damageLabel, trendLine, costLine];
+  const lines = [damageLabel, recoveredLabel, trendLine, costLine];
 
   ctx.save();
   ctx.font = `${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
