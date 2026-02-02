@@ -21,6 +21,7 @@ import all6MetaP3P6Raw from "../../../../scripts/params/showcase/all6_meta_p3p6_
 import all6ClockTurRaw from "../../../../scripts/params/showcase/all6_clock_tur.json";
 import all6OpkRaw from "../../../../scripts/params/showcase/all6_opk_coupling.json";
 import all6CodeMaintRaw from "../../../../scripts/params/showcase/all6_code_maintenance.json";
+import all6InjuryHealingRaw from "../../../../scripts/params/showcase/all6_injury_healing.json";
 
 export type PresetEntry = {
   id: string;
@@ -28,6 +29,9 @@ export type PresetEntry = {
   label: string;
   sourcePath: string;
   supports?: string[];
+  tags?: string[];
+  blurb?: string;
+  recommendedView?: string;
   params: Partial<SimParams>;
 };
 
@@ -46,35 +50,55 @@ const toParams = (raw: Record<string, unknown>) => sanitizeParams(raw);
 export const PRESET_CATALOG: PresetEntry[] = [
   {
     id: "showcase_all6_meta_p3p6_drive",
-    group: "Showcase (P1–P6)",
+    group: "Showcase (All 6 primitives)",
     label: "All6 showcase: Meta + P3/P6 drive",
     sourcePath: "scripts/params/showcase/all6_meta_p3p6_drive.json",
     supports: ["showcase:all6", "C_META_ETA_ALIGN_1"],
+    tags: ["Shows: meta alignment under drive", "Watch: sdiff drops"],
+    blurb: "Drive with P3/P6 and eta to tighten alignment between base and meta layers.",
+    recommendedView: "Meta alignment charts + S Layer Stack",
     params: toParams(all6MetaP3P6Raw as Record<string, unknown>),
   },
   {
     id: "showcase_all6_clock_tur",
-    group: "Showcase (P1–P6)",
+    group: "Showcase (All 6 primitives)",
     label: "All6 showcase: Clock/TUR friendly",
     sourcePath: "scripts/params/showcase/all6_clock_tur.json",
     supports: ["showcase:all6", "C_CLOCK_DRIFT_1", "C_TUR_1", "badge:tur"],
+    tags: ["Shows: Clock drift under drive", "Shows: TUR ≥ 1"],
+    blurb: "Under drive, clock current becomes nonzero and the TUR estimate clears the bound.",
     params: toParams(all6ClockTurRaw as Record<string, unknown>),
   },
   {
     id: "showcase_all6_opk_coupling",
-    group: "Showcase (P1–P6)",
+    group: "Showcase (All 6 primitives)",
     label: "All6 showcase: opK coupling",
     sourcePath: "scripts/params/showcase/all6_opk_coupling.json",
     supports: ["showcase:all6", "C_OPK_INV_1", "C_OPK_EFFECT_1", "badge:opk-budget"],
+    tags: ["Shows: opK budget constraint", "Watch: residuals stay low"],
+    blurb: "Token budgets remain conserved while coupling influences alignment.",
     params: toParams(all6OpkRaw as Record<string, unknown>),
   },
   {
     id: "showcase_all6_code_maintenance",
-    group: "Showcase (P1–P6)",
+    group: "Showcase (All 6 primitives)",
     label: "All6 showcase: Code maintenance",
     sourcePath: "scripts/params/showcase/all6_code_maintenance.json",
     supports: ["showcase:all6", "C_CODE_MAINT_1", "badge:code-maint"],
+    tags: ["Shows: repair lowers mismatch", "Watch: error collapse"],
+    blurb: "Drive-enabled repair reduces mismatch and reconstruction error over time.",
     params: toParams(all6CodeMaintRaw as Record<string, unknown>),
+  },
+  {
+    id: "showcase_all6_injury_healing",
+    group: "Showcase (All 6 primitives)",
+    label: "All6 showcase: Injury → Healing",
+    sourcePath: "scripts/params/showcase/all6_injury_healing.json",
+    supports: ["showcase:injury-healing", "C_CODE_MAINT_1"],
+    tags: ["Shows: Injury→Healing", "Watch: injury map shrinks", "Compare: No repair"],
+    blurb: "Inject damage into Meta0 and watch mismatch shrink under drive.",
+    recommendedView: "S Diff |Base−Meta0| + Injury map + Life HUD",
+    params: toParams(all6InjuryHealingRaw as Record<string, unknown>),
   },
   {
     id: "base_null_balanced",
@@ -82,6 +106,7 @@ export const PRESET_CATALOG: PresetEntry[] = [
     label: "Base null balanced",
     sourcePath: "scripts/params/base_null_balanced.json",
     supports: ["C_BASE_NULL_1", "C_EP_EXACT_NULL_1", "badge:ep-null"],
+    tags: ["Control: Null baseline", "Shows: EP≈0"],
     params: toParams(baseNullBalancedRaw as Record<string, unknown>),
   },
   {
@@ -138,6 +163,7 @@ export const PRESET_CATALOG: PresetEntry[] = [
     label: "Clock null",
     sourcePath: "scripts/params/clock_code/clock_null.json",
     supports: ["C_CLOCK_DRIFT_1", "badge:clock-null"],
+    tags: ["Control: Null clock", "Shows: drift≈0"],
     params: toParams(clockNullRaw as Record<string, unknown>),
   },
   {
@@ -178,6 +204,7 @@ export const PRESET_CATALOG: PresetEntry[] = [
     label: "Code P6 clock gated",
     sourcePath: "scripts/params/clock_code/code_p6_clock_gated.json",
     supports: ["C_TRAVERSAL_NEED_1", "C_TRAVERSAL_ORIENT_1", "badge:code-maint"],
+    tags: ["Shows: traversal needed for recovery", "Compare: No P6"],
     params: toParams(codeP6ClockGatedRaw as Record<string, unknown>),
   },
   {

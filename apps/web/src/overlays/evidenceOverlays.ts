@@ -650,6 +650,111 @@ function drawCertStampStrip(ctx: CanvasRenderingContext2D, env: EvidenceEnv): vo
   ctx.restore();
 }
 
+export type LifeHudState = {
+  updatedAtSteps: number;
+  damageCells: number | null;
+  damagePct: number | null;
+  trendPerSample: number | null;
+  trendLabel: string;
+  epExactRate: number | null;
+  epRepairRate: number | null;
+};
+
+function formatHudValue(value: number | null): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  const abs = Math.abs(value);
+  if (abs >= 1e4 || (abs > 0 && abs < 1e-3)) {
+    return value.toExponential(2);
+  }
+  return value.toFixed(3);
+}
+
+export function drawLifeHud(ctx: CanvasRenderingContext2D, hud: LifeHudState): void {
+  const dpr = getDpr();
+  const fontSize = 13 * dpr;
+  const lineHeight = fontSize * 1.35;
+  const padding = 8 * dpr;
+
+  const damageLabel =
+    hud.damageCells !== null
+      ? `Damage: ${hud.damageCells} cells${
+          hud.damagePct !== null ? ` (${(hud.damagePct * 100).toFixed(1)}%)` : ""
+        }`
+      : "Damage: —";
+
+  let trendSymbol = "—";
+  if (hud.trendLabel === "healing") trendSymbol = "↓";
+  if (hud.trendLabel === "worsening") trendSymbol = "↑";
+  if (hud.trendLabel === "stable") trendSymbol = "→";
+  const trendLabel = hud.trendLabel === "—" ? "—" : `${trendSymbol} ${hud.trendLabel}`;
+  const trendLine = `Trend: ${trendLabel}`;
+
+  const epText = formatHudValue(hud.epExactRate);
+  const repairText = formatHudValue(hud.epRepairRate);
+  const costLine = `Cost: EP ${epText} | Repair ${repairText}`;
+
+  const lines = [damageLabel, trendLine, costLine];
+
+  ctx.save();
+  ctx.font = `${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  ctx.textBaseline = "top";
+
+  let maxWidth = 0;
+  for (const line of lines) {
+    const m = ctx.measureText(line);
+    if (m.width > maxWidth) maxWidth = m.width;
+  }
+
+  const boxWidth = maxWidth + padding * 2;
+  const boxHeight = lines.length * lineHeight + padding * 2;
+  const x = padding;
+  const y = ctx.canvas.height - boxHeight - padding;
+
+  ctx.fillStyle = "rgba(15, 20, 28, 0.78)";
+  ctx.fillRect(x, y, boxWidth, boxHeight);
+  ctx.strokeStyle = OVERLAY_STYLE.panelBorder;
+  ctx.lineWidth = 1 * dpr;
+  ctx.strokeRect(x, y, boxWidth, boxHeight);
+
+  ctx.fillStyle = "rgba(210, 220, 235, 0.95)";
+  for (let i = 0; i < lines.length; i++) {
+    ctx.fillText(lines[i]!, x + padding, y + padding + i * lineHeight);
+  }
+
+  ctx.restore();
+}
+
+export type InjuryMapOptions = {
+  alpha?: number;
+  borderOnly?: boolean;
+};
+
+export function drawInjuryMapOverlay(
+  ctx: CanvasRenderingContext2D | null,
+  grid: number,
+  badCellIdx: Uint32Array,
+  legendLines: string[],
+  options: InjuryMapOptions = {}
+): void {
+  if (!ctx || grid <= 0) return;
+  const { alpha = 0.85, borderOnly = true } = options;
+  if (badCellIdx.length > 0) {
+    drawBadCells(ctx, grid, badCellIdx, {
+      alpha,
+      color: OVERLAY_STYLE.badCellColor,
+      borderOnly,
+    });
+  }
+  if (legendLines.length > 0) {
+    drawCornerLabel(ctx, legendLines, {
+      corner: "topRight",
+      alpha: 0.9,
+      bgColor: OVERLAY_STYLE.panelBg,
+      textColor: OVERLAY_STYLE.textMain,
+    });
+  }
+}
+
 // ============================================================================
 // Evidence Environment (passed to overlay draw functions)
 // ============================================================================

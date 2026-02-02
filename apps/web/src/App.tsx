@@ -1,3 +1,4 @@
+console.log("[DEBUG] App.tsx start");
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { SimWorkerClient } from "./sim/workerClient";
 import {
@@ -8,13 +9,17 @@ import {
   startRun,
 } from "./sim/runCache";
 import { SNAPSHOT_VERSION } from "./sim/workerMessages";
-import type { Diagnostics, EnergyBreakdown, SimParams } from "./sim/workerMessages";
+import type { Diagnostics, EnergyBreakdown, SimParams, SimSnapshot } from "./sim/workerMessages";
 import { PRESET_CATALOG, type PresetEntry } from "./sim/presetCatalog";
 import {
   drawEvidenceOverlays,
   type EvidenceEnv,
   type EvidenceOverlayTarget,
+  drawLifeHud,
+  type LifeHudState,
+  drawInjuryMapOverlay,
 } from "./overlays/evidenceOverlays";
+console.log("[DEBUG] imports done");
 
 const SETTINGS_KEY = "six-birds-settings";
 
@@ -38,6 +43,8 @@ interface SavedSettings {
   overlayChannel: "none" | "baseS" | "metaS" | "metaN" | "metaA" | "metaW";
   presetId: string;
   evidenceOverlaysOn: boolean;
+  injuryMapOn: boolean;
+  lifeHudOn: boolean;
 }
 
 function loadSettings(): Partial<SavedSettings> {
@@ -318,6 +325,23 @@ function meanAbsDiff(fieldA: Uint8Array, fieldB: Uint8Array, cells: number): num
   return sum / count;
 }
 
+function computeBadCellMask(
+  baseField: Uint8Array,
+  metaField: Uint8Array,
+  cells: number,
+  tau: number
+): { count: number; indices: Uint32Array<ArrayBufferLike> } {
+  const badIndices: number[] = [];
+  const count = Math.min(cells, baseField.length, metaField.length);
+  for (let i = 0; i < count; i++) {
+    const diff = Math.abs((baseField[i] ?? 0) - (metaField[i] ?? 0));
+    if (diff > tau) {
+      badIndices.push(i);
+    }
+  }
+  return { count: badIndices.length, indices: new Uint32Array(badIndices) };
+}
+
 type GraphStats = {
   edges: number;
   components: number;
@@ -552,6 +576,10 @@ type EpPoint = {
   naive: number;
 };
 
+type StoryScenarioId = "injury_healing";
+type StoryPhase = "idle" | "preparing" | "warming" | "recovering" | "done" | "resetting";
+type CompareControlId = "no_repair" | "no_eta" | "no_p6";
+
 const EP_WINDOW_STEPS = 20000;
 const CERT_STABILITY_K = 5;
 const CERT_MIN_STEPS = EP_WINDOW_STEPS;
@@ -575,6 +603,8 @@ const MAINT_ERR_FRAC = 0.5;
 const MAINT_SERIES_CAP = 240;
 /** Threshold for "bad cell" in maintenance overlay: |base - meta0| > tau */
 const MAINT_BAD_CELL_TAU = 3;
+const INJURY_MASK_EVERY_STEPS = 10000;
+const INJURY_MASK_MAX_CELLS = 65536;
 const SSTACK_STATS_EVERY_STEPS = 20000;
 const MOVE_P5_BASE = 7;
 const MOVE_P5_META = 8;
@@ -583,6 +613,36 @@ const DEFAULT_HISTORY_CAP = 400;
 const DEFAULT_STACK_MAX_LAYERS = 4;
 const META_ALIGN_SERIES_CAP = 400;
 const DEFAULT_PRESET_ID = "base_null_balanced";
+const STORY_SCENARIOS = {
+  injury_healing: {
+    presetId: "showcase_all6_injury_healing",
+    n: 200,
+    seed: 1,
+    warmupSteps: 100000,
+    perturbMode: "randomize",
+    recoverySteps: 300000,
+    autoPause: true,
+    forceSStackMode: "diff_base",
+  },
+} as const;
+const STORY_SCENARIO_META = {
+  injury_healing: {
+    label: "Injury → Healing",
+    presetId: "showcase_all6_injury_healing",
+    description: [
+      "We inject damage into Meta0, then watch mismatch shrink under drive.",
+      "Watch the Injury Map shrink and the Life HUD trend flip to healing.",
+    ],
+    recommendedCompareControl: "no_repair" as CompareControlId,
+  },
+} as const;
+const STORY_STATUS_IDLE = "Story: idle";
+const AB_STEP_CHUNK = 5000;
+const COMPARE_CONTROL_LABELS: Record<CompareControlId, string> = {
+  no_repair: "No repair (P5 off)",
+  no_eta: "No coupling (η=0)",
+  no_p6: "No P6",
+};
 
 function pushHistory(series: number[], value: number, cap: number) {
   series.push(value);
@@ -1163,6 +1223,7 @@ const DEFAULT_PARAMS: SimParams = {
 };
 
 export default function App() {
+  console.log("[DEBUG] App() render start");
   // Load saved settings once on mount
   const [savedSettings] = useState(() => loadSettings());
 
@@ -1218,6 +1279,13 @@ export default function App() {
     lastPerturbStep: number | null;
     recoverySteps: number | null;
   }>(null);
+  const [lifeHud, setLifeHud] = useState<LifeHudState | null>(null);
+  const [storyScenarioId, setStoryScenarioId] = useState<StoryScenarioId>("injury_healing");
+  const [storyPhase, setStoryPhase] = useState<StoryPhase>("idle");
+  const [storyStatus, setStoryStatus] = useState<string>(STORY_STATUS_IDLE);
+  const [compareOn, setCompareOn] = useState(false);
+  const [compareControl, setCompareControl] = useState<CompareControlId>("no_repair");
+  const [compareReady, setCompareReady] = useState(false);
   const [sStackMode, setSStackMode] = useState<"layers" | "diff_base" | "diff_meta">("layers");
   const [sStackDiffIndex, setSStackDiffIndex] = useState(0);
   const [sStackMetaStart, setSStackMetaStart] = useState(0);
@@ -1267,6 +1335,9 @@ export default function App() {
   const [evidenceOverlaysOn, setEvidenceOverlaysOn] = useState(
     savedSettings.evidenceOverlaysOn ?? true
   );
+  const [injuryMapOn, setInjuryMapOn] = useState(savedSettings.injuryMapOn ?? true);
+  const [lifeHudOn, setLifeHudOn] = useState(savedSettings.lifeHudOn ?? true);
+  const injuryMapOnRef = useRef(injuryMapOn);
   const [overlayLayerIndex, setOverlayLayerIndex] = useState(0);
   const [status, setStatus] = useState<"idle" | "initializing" | "ready" | "running">("idle");
   const [error, setError] = useState<string | null>(null);
@@ -1345,8 +1416,12 @@ export default function App() {
     err: [] as number[],
     sdiff: [] as number[],
     repair: [] as number[],
+    damage: [] as number[],
   });
+  const maintForceComputeRef = useRef(false);
   const maintCanvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+  const lifeHudRef = useRef<LifeHudState | null>(null);
+  const injuryMaskStepRef = useRef(0);
   const maintRef = useRef({
     lastStep: 0,
     lastEpRepair: 0,
@@ -1358,9 +1433,68 @@ export default function App() {
     seed: 1234567,
     // Evidence overlay: bad cells for maintenance cert
     badCells: 0,
-    badCellIdx: new Uint32Array(0),
+    badCellIdx: new Uint32Array(0) as Uint32Array<ArrayBufferLike>,
     badTau: MAINT_BAD_CELL_TAU,
+    badCellUpdatedAt: 0,
     errF0_5: null as number | null,
+  });
+  const storyRef = useRef<{
+    scenarioId: StoryScenarioId;
+    phase: StoryPhase;
+    injuryAt: number;
+    endAt: number;
+    startedAt: number;
+    injuryTriggered: boolean;
+    paramsApplied: SimParams | null;
+    compareOn: boolean;
+  }>({
+    scenarioId: "injury_healing",
+    phase: "idle",
+    injuryAt: 0,
+    endAt: 0,
+    startedAt: 0,
+    injuryTriggered: false,
+    paramsApplied: null,
+    compareOn: false,
+  });
+  const storyStatusRef = useRef<string>(STORY_STATUS_IDLE);
+  const clientBRef = useRef<SimWorkerClient | null>(null);
+  const abDiffARef = useRef<HTMLCanvasElement | null>(null);
+  const abDiffBRef = useRef<HTMLCanvasElement | null>(null);
+  const abRef = useRef<{
+    enabled: boolean;
+    readyA: boolean;
+    readyB: boolean;
+    configuredA: boolean;
+    configuredB: boolean;
+    inFlight: boolean;
+    awaitingA: boolean;
+    awaitingB: boolean;
+    totalSteps: number;
+    injuryTriggered: boolean;
+    paramsA: SimParams | null;
+    paramsB: SimParams | null;
+    badCellsB: number;
+    badCellIdxB: Uint32Array<ArrayBufferLike>;
+    badCellUpdatedAtB: number;
+    forceMaskB: boolean;
+  }>({
+    enabled: false,
+    readyA: false,
+    readyB: false,
+    configuredA: false,
+    configuredB: false,
+    inFlight: false,
+    awaitingA: false,
+    awaitingB: false,
+    totalSteps: 0,
+    injuryTriggered: false,
+    paramsA: null,
+    paramsB: null,
+    badCellsB: 0,
+    badCellIdxB: new Uint32Array(0) as Uint32Array<ArrayBufferLike>,
+    badCellUpdatedAtB: 0,
+    forceMaskB: false,
   });
   const metaAlignHistoryRef = useRef({
     sdiffBase: [] as number[],
@@ -1383,6 +1517,9 @@ export default function App() {
   const metaLayerCount = metaSnapshot?.layers ?? 0;
   const selectedPreset =
     PRESET_CATALOG.find((entry) => entry.id === presetId) ?? PRESET_CATALOG[0] ?? null;
+  const storyMeta = STORY_SCENARIO_META[storyScenarioId];
+  const storyPresetEntry =
+    PRESET_CATALOG.find((entry) => entry.id === storyMeta.presetId) ?? null;
 
   // Save settings to localStorage when they change
   useEffect(() => {
@@ -1406,12 +1543,14 @@ export default function App() {
       overlayChannel,
       presetId,
       evidenceOverlaysOn,
+      injuryMapOn,
+      lifeHudOn,
     });
   }, [
     n, seed, bondThreshold, bondsMode, graphStatsMode, stackMaxLayers,
     historyCap, recordEverySteps, p1Enabled, p2Enabled, p3Enabled,
     p4Enabled, p5Enabled, p6Enabled, safeThreshold, colorSource,
-    overlayChannel, presetId, evidenceOverlaysOn,
+    overlayChannel, presetId, evidenceOverlaysOn, injuryMapOn, lifeHudOn,
   ]);
 
   const handleResetSettings = useCallback(() => {
@@ -1435,6 +1574,8 @@ export default function App() {
     setColorSource("p4");
     setOverlayChannel("none");
     setEvidenceOverlaysOn(true);
+    setInjuryMapOn(true);
+    setLifeHudOn(true);
     setPresetId(DEFAULT_PRESET_ID);
     setParamsDraft(DEFAULT_PARAMS);
     setParamsApplied(DEFAULT_PARAMS);
@@ -1448,11 +1589,18 @@ export default function App() {
     return Math.max(1, Math.floor(steps));
   };
   const bondsEverySteps = resolveBondsEverySteps();
+  const bondThresholdRef = useRef(bondThreshold);
+  const bondsEveryStepsRef = useRef(bondsEverySteps);
+
+  useEffect(() => {
+    bondThresholdRef.current = bondThreshold;
+    bondsEveryStepsRef.current = bondsEverySteps;
+  }, [bondThreshold, bondsEverySteps]);
 
   // Use module-level singleton to avoid React StrictMode double-creation
   const client = getClient();
 
-  const applyPreset = (entry: PresetEntry) => {
+  const buildPresetParams = (entry: PresetEntry) => {
     const nextDraft: SimParams = { ...DEFAULT_PARAMS, ...entry.params };
     const nextP1 = (nextDraft.pWrite ?? 0) > 0;
     const nextP2 = (nextDraft.pAWrite ?? 0) > 0;
@@ -1460,14 +1608,6 @@ export default function App() {
     const nextP5 = (nextDraft.pSWrite ?? 0) > 0;
     const nextP3 = (nextDraft.p3On ?? 0) > 0;
     const nextP6 = (nextDraft.p6On ?? 0) > 0;
-
-    setP1Enabled(nextP1);
-    setP2Enabled(nextP2);
-    setP4Enabled(nextP4);
-    setP5Enabled(nextP5);
-    setP3Enabled(nextP3);
-    setP6Enabled(nextP6);
-    setParamsDraft(nextDraft);
 
     const nextApplied: SimParams = {
       ...nextDraft,
@@ -1478,7 +1618,36 @@ export default function App() {
       pNWrite: nextP4 ? nextDraft.pNWrite : 0,
       pSWrite: nextP5 ? nextDraft.pSWrite : 0,
     };
+
+    return { nextDraft, nextApplied, nextP1, nextP2, nextP3, nextP4, nextP5, nextP6 };
+  };
+
+  const applyCompareControl = (base: SimParams, control: CompareControlId): SimParams => {
+    const next: SimParams = { ...base };
+    if (control === "no_repair") {
+      next.pSWrite = 0;
+    } else if (control === "no_eta") {
+      next.eta = 0;
+    } else if (control === "no_p6") {
+      next.p6On = 0;
+    }
+    return next;
+  };
+
+  const applyPreset = (entry: PresetEntry) => {
+    const { nextDraft, nextApplied, nextP1, nextP2, nextP3, nextP4, nextP5, nextP6 } =
+      buildPresetParams(entry);
+
+    setP1Enabled(nextP1);
+    setP2Enabled(nextP2);
+    setP4Enabled(nextP4);
+    setP5Enabled(nextP5);
+    setP3Enabled(nextP3);
+    setP6Enabled(nextP6);
+    setParamsDraft(nextDraft);
     setParamsApplied(nextApplied);
+
+    return nextApplied;
   };
 
   const presetInitRef = useRef(false);
@@ -1493,6 +1662,36 @@ export default function App() {
   useEffect(() => {
     attachToWindow();
     const offReady = client.onReady(() => {
+      const story = storyRef.current;
+      if (story.phase === "preparing" || story.phase === "resetting") {
+        if (story.compareOn) {
+          handleAbReady("A");
+          return;
+        }
+        const scenario = STORY_SCENARIOS[story.scenarioId];
+        const paramsForConfig = story.paramsApplied ?? paramsApplied;
+        client.send({ type: "config", bondThreshold, params: paramsForConfig, bondsEverySteps });
+        if (story.phase === "preparing") {
+          story.phase = "warming";
+          story.startedAt = 0;
+          story.injuryTriggered = false;
+          story.injuryAt = scenario.warmupSteps;
+          story.endAt = scenario.warmupSteps + scenario.recoverySteps;
+          setStoryPhase("warming");
+          const nextStatus = `Story: warming 0/${scenario.warmupSteps}`;
+          storyStatusRef.current = nextStatus;
+          setStoryStatus(nextStatus);
+          setStatus("running");
+          client.send({ type: "resume" });
+        } else {
+          story.phase = "idle";
+          setStoryPhase("idle");
+          storyStatusRef.current = STORY_STATUS_IDLE;
+          setStoryStatus(STORY_STATUS_IDLE);
+          setStatus("ready");
+        }
+        return;
+      }
       setStatus((s) => (s === "running" ? "running" : "ready"));
     });
     const offErr = client.onError((m) => setError(m));
@@ -1504,6 +1703,7 @@ export default function App() {
       let codeMaintPassNow: boolean | null = null;
       let epExactTotalNow: number | null = null;
       let stepNow: number | null = null;
+      let lifeHudNow: LifeHudState | null = null;
       let clockQ: number | null = null;
       let clockFwd: number | null = null;
       let clockBwd: number | null = null;
@@ -1917,6 +2117,17 @@ export default function App() {
                 };
                 drawEvidenceOverlays("sStackDiff", diffCanvas, evidenceEnv);
               }
+              if (injuryMapOn) {
+                const maint = maintRef.current;
+                const damagePct = cells > 0 ? maint.badCells / cells : null;
+                const legend = [
+                  "Injury map",
+                  `τ = ${maint.badTau}`,
+                  `bad = ${maint.badCells}${damagePct !== null ? ` (${(damagePct * 100).toFixed(1)}%)` : ""}`,
+                  maint.badCellUpdatedAt ? `@${maint.badCellUpdatedAt}` : "",
+                ].filter((line) => line !== "");
+                drawInjuryMapOverlay(diffCanvas.getContext("2d"), grid, maint.badCellIdx, legend);
+              }
             }
             if (shouldUpdateSStackStats) {
               nextDiffMean = meanAbsDiff(baseField, meta0, cells);
@@ -1988,14 +2199,46 @@ export default function App() {
         setSStackDiffMean(null);
       }
 
+      const storyRuntime = storyRef.current;
+      if (!storyRuntime.compareOn && (storyRuntime.phase === "warming" || storyRuntime.phase === "recovering")) {
+        const scenario = STORY_SCENARIOS[storyRuntime.scenarioId];
+        const stepsNow = epStepCounterRef.current;
+        if (storyRuntime.phase === "warming") {
+          const nextStatus = `Story: warming ${stepsNow}/${scenario.warmupSteps}`;
+          updateStoryStatus(nextStatus);
+          if (!storyRuntime.injuryTriggered && stepsNow >= storyRuntime.injuryAt) {
+            storyRuntime.injuryTriggered = true;
+            storyRuntime.phase = "recovering";
+            setStoryPhase("recovering");
+            updateStoryStatus(`Story: injury triggered @ ${stepsNow}`);
+            triggerPerturb(scenario.perturbMode);
+          }
+        } else if (storyRuntime.phase === "recovering") {
+          const progress = Math.max(0, stepsNow - storyRuntime.injuryAt);
+          updateStoryStatus(`Story: recovering ${progress}/${scenario.recoverySteps}`);
+          if (stepsNow >= storyRuntime.endAt) {
+            if (scenario.autoPause) {
+              client.send({ type: "pause" });
+              setStatus("ready");
+            }
+            storyRuntime.phase = "done";
+            setStoryPhase("done");
+            updateStoryStatus("Story: complete");
+          }
+        }
+      }
+
       const maintStepNow = epStepCounterRef.current;
+      const forceMaint = maintForceComputeRef.current;
       if (
-        maintStepNow > 0 &&
         epExactByMoveNow &&
-        maintStepNow - maintRef.current.lastStep >= MAINT_EVERY_STEPS
+        (forceMaint || (maintStepNow > 0 && maintStepNow - maintRef.current.lastStep >= MAINT_EVERY_STEPS))
       ) {
+        if (forceMaint) {
+          maintForceComputeRef.current = false;
+        }
         const maint = maintRef.current;
-        const windowSteps = maintStepNow - maint.lastStep;
+        const windowSteps = Math.max(0, maintStepNow - maint.lastStep);
         const epRepairTotal =
           (epExactByMoveNow[MOVE_P5_BASE] ?? 0) + (epExactByMoveNow[MOVE_P5_META] ?? 0);
         const epClockTotal = epExactByMoveNow[MOVE_CLOCK] ?? 0;
@@ -2011,7 +2254,7 @@ export default function App() {
         let sdiffBase: number | null = null;
         let errF0_5: number | null = null;
         let badCellCount = 0;
-        let badCellIdxArr = new Uint32Array(0);
+        let badCellIdxArr: Uint32Array<ArrayBufferLike> = new Uint32Array(0);
         if (paramsApplied.metaLayers >= 1 && cells > 0 && s.metaField.length >= cells) {
           const meta0 = s.metaField.subarray(0, cells);
           sdiffBase = meanAbsDiff(s.baseSField, meta0, cells);
@@ -2024,17 +2267,9 @@ export default function App() {
             MAINT_ERR_FRAC,
             maint.seed++
           );
-          // Compute bad cells for evidence overlay (cells where |base - meta0| > tau)
-          const tau = MAINT_BAD_CELL_TAU;
-          const badIndices: number[] = [];
-          for (let i = 0; i < cells; i++) {
-            const diff = Math.abs((s.baseSField[i] ?? 0) - (meta0[i] ?? 0));
-            if (diff > tau) {
-              badIndices.push(i);
-            }
-          }
-          badCellCount = badIndices.length;
-          badCellIdxArr = new Uint32Array(badIndices);
+          const mask = computeBadCellMask(s.baseSField, meta0, cells, MAINT_BAD_CELL_TAU);
+          badCellCount = mask.count;
+          badCellIdxArr = mask.indices;
         }
         // Store bad cell data for evidence overlays
         maint.badCells = badCellCount;
@@ -2092,6 +2327,34 @@ export default function App() {
           const canvas = maintCanvasRefs.current["maint_repair"];
           if (canvas) drawSparkline(canvas, histories.repair, "rgba(140, 200, 255, 0.85)");
         }
+          histories.damage.push(badCellCount);
+          if (histories.damage.length > MAINT_SERIES_CAP) histories.damage.shift();
+        const trendWindow = 8;
+        const trendEps = 0.5;
+        let trendPerSample: number | null = null;
+        let trendLabel = "—";
+        if (histories.damage.length >= trendWindow) {
+          const start = histories.damage[histories.damage.length - trendWindow] ?? badCellCount;
+          const end = histories.damage[histories.damage.length - 1] ?? badCellCount;
+          trendPerSample = (end - start) / (trendWindow - 1);
+          if (trendPerSample < -trendEps) trendLabel = "healing";
+          else if (trendPerSample > trendEps) trendLabel = "worsening";
+          else trendLabel = "stable";
+        }
+        const damagePct = cells > 0 ? badCellCount / cells : null;
+        const nextHud: LifeHudState = {
+          updatedAtSteps: maintStepNow,
+          damageCells: badCellCount,
+          damagePct,
+          trendPerSample,
+          trendLabel,
+          epExactRate: currentEpExactRate,
+          epRepairRate,
+        };
+        maint.badCellUpdatedAt = maintStepNow;
+        lifeHudNow = nextHud;
+        lifeHudRef.current = nextHud;
+        setLifeHud(nextHud);
 
         const warmMaint = epStepCounterRef.current >= 200000;
         if (warmMaint) {
@@ -2102,6 +2365,55 @@ export default function App() {
         } else {
           codeMaintPassNow = false;
         }
+      }
+
+      const injuryMaskEligible =
+        injuryMapOn &&
+        cells > 0 &&
+        cells <= INJURY_MASK_MAX_CELLS &&
+        paramsApplied.metaLayers >= 1 &&
+        s.metaField.length >= cells;
+      if (injuryMaskEligible) {
+        const storyPhaseNow = storyRef.current.phase;
+        const isStoryActive = storyPhaseNow === "warming" || storyPhaseNow === "recovering";
+        const stepNowForMask = epStepCounterRef.current;
+        const due =
+          stepNowForMask - injuryMaskStepRef.current >= INJURY_MASK_EVERY_STEPS ||
+          (isStoryActive && injuryMaskStepRef.current === 0);
+        if (due) {
+          const meta0 = s.metaField.subarray(0, cells);
+          const mask = computeBadCellMask(s.baseSField, meta0, cells, MAINT_BAD_CELL_TAU);
+          maintRef.current.badCells = mask.count;
+          maintRef.current.badCellIdx = mask.indices;
+          maintRef.current.badTau = MAINT_BAD_CELL_TAU;
+          maintRef.current.badCellUpdatedAt = stepNowForMask;
+          injuryMaskStepRef.current = stepNowForMask;
+        }
+      }
+
+      if (compareOn && storyRef.current.compareOn && storyRef.current.phase !== "idle") {
+        const canvasA = abDiffARef.current;
+        if (canvasA && cells > 0 && s.metaField.length >= cells) {
+          const meta0 = s.metaField.subarray(0, cells);
+          drawFieldAbsDiffHeatmap(canvasA, s.baseSField, meta0, grid, paramsApplied.lS);
+          if (injuryMapOn) {
+            const maint = maintRef.current;
+            const damagePct = cells > 0 ? maint.badCells / cells : null;
+            const legend = [
+              "Injury map",
+              `τ = ${MAINT_BAD_CELL_TAU}`,
+              `bad = ${maint.badCells}${damagePct !== null ? ` (${(damagePct * 100).toFixed(1)}%)` : ""}`,
+              maint.badCellUpdatedAt ? `@${maint.badCellUpdatedAt}` : "",
+            ].filter((line) => line !== "");
+            drawInjuryMapOverlay(canvasA.getContext("2d"), grid, maint.badCellIdx, legend);
+          }
+        }
+      }
+      if (abRef.current.enabled && abRef.current.awaitingA) {
+        abRef.current.awaitingA = false;
+      }
+      if (abRef.current.enabled) {
+        maybeAdvanceAb();
       }
 
       const isNullConfig = !p3Enabled && !p6Enabled;
@@ -2201,6 +2513,14 @@ export default function App() {
         next.codeMaint !== certPassed.codeMaint
       ) {
         setCertPassed(next);
+      }
+
+      if (lifeHudOn && canvas) {
+        const hud = lifeHudNow ?? lifeHudRef.current;
+        const ctx = hud ? canvas.getContext("2d") : null;
+        if (ctx && hud) {
+          drawLifeHud(ctx, hud);
+        }
       }
 
       // Draw evidence overlays on main canvas (after cert evaluation for responsiveness)
@@ -2448,6 +2768,8 @@ export default function App() {
     colorSource,
     overlayChannel,
     overlayLayerIndex,
+    bondThreshold,
+    bondsEverySteps,
     paramsApplied,
     bondsMode,
     graphStatsMode,
@@ -2468,6 +2790,9 @@ export default function App() {
     certPassed.opkBudget,
     certPassed.codeMaint,
     evidenceOverlaysOn,
+    lifeHudOn,
+    injuryMapOn,
+    compareOn,
   ]);
 
   useEffect(() => {
@@ -2490,7 +2815,10 @@ export default function App() {
         opkBudget: 0,
         codeMaint: 0,
       };
-      maintHistoryRef.current = { err: [], sdiff: [], repair: [] };
+      maintHistoryRef.current = { err: [], sdiff: [], repair: [], damage: [] };
+      maintForceComputeRef.current = false;
+      lifeHudRef.current = null;
+      injuryMaskStepRef.current = 0;
       maintRef.current = {
         lastStep: 0,
         lastEpRepair: 0,
@@ -2501,8 +2829,9 @@ export default function App() {
         recoverySteps: null,
         seed: 1234567,
         badCells: 0,
-        badCellIdx: new Uint32Array(0),
+        badCellIdx: new Uint32Array(0) as Uint32Array<ArrayBufferLike>,
         badTau: MAINT_BAD_CELL_TAU,
+        badCellUpdatedAt: 0,
         errF0_5: null,
       };
       metaAlignHistoryRef.current = { sdiffBase: [], sdiffMeta: [], wdiffMeta: [] };
@@ -2527,6 +2856,7 @@ export default function App() {
       setOpkViewVersion(0);
       setOpkViewStatus("waiting");
       setMaintStats(null);
+      setLifeHud(null);
       setLayerSafeStats([]);
       setSStackDiffMean(null);
       setMetaAlign(null);
@@ -2543,6 +2873,10 @@ export default function App() {
     }
   }, [status]);
 
+  useEffect(() => {
+    injuryMapOnRef.current = injuryMapOn;
+  }, [injuryMapOn]);
+
   // Note: We don't terminate the singleton worker - it lives for the page lifetime
 
   useEffect(() => {
@@ -2553,6 +2887,37 @@ export default function App() {
     const t = window.setTimeout(() => setInitSlow(true), 5000);
     return () => window.clearTimeout(t);
   }, [status]);
+
+  useEffect(() => {
+    if (!compareOn) {
+      if (clientBRef.current) {
+        clientBRef.current.terminate();
+        clientBRef.current = null;
+      }
+      abRef.current.enabled = false;
+      storyRef.current.compareOn = false;
+      setCompareReady(false);
+      return;
+    }
+    if (clientBRef.current) return;
+    setCompareReady(false);
+    const clientB = new SimWorkerClient();
+    clientBRef.current = clientB;
+    const offReady = clientB.onReady(() => {
+      setCompareReady(true);
+      handleAbReady("B");
+    });
+    const offSnap = clientB.onSnapshot((s) => handleBSnapshot(s));
+    const offErr = clientB.onError((m) => setError(`B: ${m}`));
+    return () => {
+      offReady();
+      offSnap();
+      offErr();
+      clientB.terminate();
+      clientBRef.current = null;
+      setCompareReady(false);
+    };
+  }, [compareOn]);
 
   useEffect(() => {
     if (status === "idle" || status === "initializing") return;
@@ -2809,12 +3174,187 @@ export default function App() {
       wdiffMeta: current.wdiffMeta,
     });
   };
-  const triggerPerturb = (mode: "randomize" | "zero") => {
-    const stepMark = epStepCounterRef.current > 0 ? epStepCounterRef.current : totalSteps;
+  const updateStoryStatus = (next: string) => {
+    if (storyStatusRef.current !== next) {
+      storyStatusRef.current = next;
+      setStoryStatus(next);
+    }
+  };
+  const resetAbState = () => {
+    const ab = abRef.current;
+    ab.enabled = true;
+    ab.readyA = false;
+    ab.readyB = false;
+    ab.configuredA = false;
+    ab.configuredB = false;
+    ab.inFlight = false;
+    ab.awaitingA = false;
+    ab.awaitingB = false;
+    ab.totalSteps = 0;
+    ab.injuryTriggered = false;
+    ab.badCellsB = 0;
+    ab.badCellIdxB = new Uint32Array(0) as Uint32Array<ArrayBufferLike>;
+    ab.badCellUpdatedAtB = 0;
+    ab.forceMaskB = false;
+  };
+  const sendAbStep = () => {
+    const ab = abRef.current;
+    const clientB = clientBRef.current;
+    if (!ab.enabled || ab.inFlight || !clientB) return;
+    ab.inFlight = true;
+    ab.awaitingA = true;
+    ab.awaitingB = true;
+    client.send({ type: "step", steps: AB_STEP_CHUNK });
+    clientB.send({ type: "step", steps: AB_STEP_CHUNK });
+  };
+  const maybeAdvanceAb = () => {
+    const ab = abRef.current;
+    if (!ab.enabled || !ab.inFlight || ab.awaitingA || ab.awaitingB) return;
+    ab.inFlight = false;
+    ab.totalSteps += AB_STEP_CHUNK;
+    const story = storyRef.current;
+    const scenario = STORY_SCENARIOS[story.scenarioId];
+    if (!ab.injuryTriggered && ab.totalSteps >= story.injuryAt) {
+      ab.injuryTriggered = true;
+      story.phase = "recovering";
+      setStoryPhase("recovering");
+      updateStoryStatus(`Story: injury triggered @ ${ab.totalSteps}`);
+      const injurySeed = scenario.seed * 1000 + ab.totalSteps;
+      triggerPerturb(scenario.perturbMode, injurySeed, ab.totalSteps);
+      const clientB = clientBRef.current;
+      if (clientB) {
+        clientB.send({
+          type: "perturb",
+          params: {
+            target: "metaS",
+            layer: 0,
+            frac: 0.3,
+            mode: scenario.perturbMode,
+            seed: injurySeed,
+          },
+        });
+        ab.forceMaskB = true;
+      }
+    }
+    if (story.phase === "warming") {
+      updateStoryStatus(`Story: warming ${ab.totalSteps}/${scenario.warmupSteps}`);
+    } else if (story.phase === "recovering") {
+      const progress = Math.max(0, ab.totalSteps - story.injuryAt);
+      updateStoryStatus(`Story: recovering ${progress}/${scenario.recoverySteps}`);
+    }
+    if (ab.totalSteps >= story.endAt) {
+      story.phase = "done";
+      setStoryPhase("done");
+      updateStoryStatus("Story: complete");
+      setStatus("ready");
+      return;
+    }
+    sendAbStep();
+  };
+  const handleAbReady = (side: "A" | "B") => {
+    const story = storyRef.current;
+    if (!story.compareOn) return;
+    const ab = abRef.current;
+    const bondThresholdNow = bondThresholdRef.current;
+    const bondsEveryStepsNow = bondsEveryStepsRef.current;
+    if (side === "A") {
+      ab.readyA = true;
+      if (ab.paramsA) {
+        client.send({ type: "config", bondThreshold: bondThresholdNow, params: ab.paramsA, bondsEverySteps: bondsEveryStepsNow });
+        ab.configuredA = true;
+      }
+    } else {
+      ab.readyB = true;
+      const clientB = clientBRef.current;
+      if (clientB && ab.paramsB) {
+        clientB.send({ type: "config", bondThreshold: bondThresholdNow, params: ab.paramsB, bondsEverySteps: bondsEveryStepsNow });
+        ab.configuredB = true;
+      }
+    }
+    if (ab.readyA && ab.readyB && ab.configuredA && ab.configuredB) {
+      if (story.phase === "resetting") {
+        story.phase = "idle";
+        setStoryPhase("idle");
+        updateStoryStatus(STORY_STATUS_IDLE);
+        setStatus("ready");
+        return;
+      }
+      story.phase = "warming";
+      setStoryPhase("warming");
+      updateStoryStatus(`Story: warming 0/${story.injuryAt}`);
+      setStatus("running");
+      sendAbStep();
+    }
+  };
+
+  const handleBSnapshot = (s: SimSnapshot) => {
+    const ab = abRef.current;
+    if (!ab.enabled) return;
+    if (ab.awaitingB) {
+      ab.awaitingB = false;
+    }
+    const paramsB = ab.paramsB ?? paramsApplied;
+    const grid = paramsB.gridSize;
+    const cells = grid * grid;
+    if (
+      injuryMapOnRef.current &&
+      cells > 0 &&
+      cells <= INJURY_MASK_MAX_CELLS &&
+      paramsB.metaLayers >= 1 &&
+      s.metaField.length >= cells
+    ) {
+      const stepNow = ab.totalSteps + (s.steps > 0 ? s.steps : 0);
+      const due =
+        ab.forceMaskB ||
+        ab.badCellUpdatedAtB === 0 ||
+        stepNow - ab.badCellUpdatedAtB >= INJURY_MASK_EVERY_STEPS;
+      if (due) {
+        const meta0 = s.metaField.subarray(0, cells);
+        const mask = computeBadCellMask(s.baseSField, meta0, cells, MAINT_BAD_CELL_TAU);
+        ab.badCellsB = mask.count;
+        ab.badCellIdxB = mask.indices;
+        ab.badCellUpdatedAtB = stepNow;
+        ab.forceMaskB = false;
+      }
+    }
+
+    const storyPhaseNow = storyRef.current.phase;
+    if (compareOn && storyPhaseNow !== "idle") {
+      const canvas = abDiffBRef.current;
+      if (canvas && cells > 0 && s.metaField.length >= cells) {
+        const meta0 = s.metaField.subarray(0, cells);
+        drawFieldAbsDiffHeatmap(canvas, s.baseSField, meta0, grid, paramsB.lS);
+        if (injuryMapOnRef.current) {
+          const damagePct = cells > 0 ? ab.badCellsB / cells : null;
+          const legend = [
+            "Injury map",
+            `τ = ${MAINT_BAD_CELL_TAU}`,
+            `bad = ${ab.badCellsB}${damagePct !== null ? ` (${(damagePct * 100).toFixed(1)}%)` : ""}`,
+            ab.badCellUpdatedAtB ? `@${ab.badCellUpdatedAtB}` : "",
+          ].filter((line) => line !== "");
+          drawInjuryMapOverlay(canvas.getContext("2d"), grid, ab.badCellIdxB, legend);
+        }
+      }
+    }
+
+    maybeAdvanceAb();
+  };
+  const triggerPerturb = (
+    mode: "randomize" | "zero",
+    seedOverride?: number,
+    stepOverride?: number
+  ) => {
+    const stepMark =
+      typeof stepOverride === "number"
+        ? stepOverride
+        : epStepCounterRef.current > 0
+        ? epStepCounterRef.current
+        : totalSteps;
     maintRef.current.lastPerturbStep = stepMark;
     maintRef.current.recoverySteps = null;
     maintRef.current.baselineErr = maintStats?.errF0_5 ?? null;
     maintRef.current.baselineSdiff = maintStats?.sdiffBase ?? null;
+    maintForceComputeRef.current = true;
     if (maintStats) {
       setMaintStats({
         ...maintStats,
@@ -2829,9 +3369,155 @@ export default function App() {
         layer: 0,
         frac: 0.3,
         mode,
-        seed: seed * 1000 + stepMark,
+        seed: typeof seedOverride === "number" ? seedOverride : seed * 1000 + stepMark,
       },
     });
+  };
+  const startStory = () => {
+    const scenario = STORY_SCENARIOS[storyScenarioId];
+    const entry = PRESET_CATALOG.find((item) => item.id === scenario.presetId);
+    if (!entry) return;
+    if (compareOn) {
+      const clientB = clientBRef.current;
+      if (!clientB) {
+        setError("Compare worker not ready yet.");
+        return;
+      }
+      if (status === "running") {
+        client.send({ type: "pause" });
+      }
+      setPresetId(entry.id);
+      const applied = applyPreset(entry);
+      const paramsB = applyCompareControl(applied, compareControl);
+      storyRef.current.paramsApplied = applied;
+      storyRef.current.compareOn = true;
+      resetAbState();
+      abRef.current.paramsA = applied;
+      abRef.current.paramsB = paramsB;
+      setN(scenario.n);
+      setSeed(scenario.seed);
+      setInjuryMapOn(true);
+      setLifeHudOn(true);
+      setEvidenceOverlaysOn(true);
+      if (scenario.forceSStackMode) {
+        setSStackMode(scenario.forceSStackMode);
+        setSStackDiffIndex(0);
+        setSStackMetaStart(0);
+      }
+      storyRef.current.scenarioId = storyScenarioId;
+      storyRef.current.phase = "preparing";
+      storyRef.current.injuryAt = scenario.warmupSteps;
+      storyRef.current.endAt = scenario.warmupSteps + scenario.recoverySteps;
+      storyRef.current.startedAt = 0;
+      storyRef.current.injuryTriggered = false;
+      setStoryPhase("preparing");
+      updateStoryStatus("Story: preparing A/B");
+      setStatus("initializing");
+      client.send({ type: "init", n: scenario.n, seed: scenario.seed });
+      clientB.send({ type: "init", n: scenario.n, seed: scenario.seed });
+      return;
+    }
+    if (status === "running") {
+      client.send({ type: "pause" });
+    }
+    setPresetId(entry.id);
+    const applied = applyPreset(entry);
+    storyRef.current.paramsApplied = applied;
+    storyRef.current.compareOn = false;
+    setN(scenario.n);
+    setSeed(scenario.seed);
+    setInjuryMapOn(true);
+    setLifeHudOn(true);
+    setEvidenceOverlaysOn(true);
+    if (scenario.forceSStackMode) {
+      setSStackMode(scenario.forceSStackMode);
+      setSStackDiffIndex(0);
+      setSStackMetaStart(0);
+    }
+    storyRef.current.scenarioId = storyScenarioId;
+    storyRef.current.phase = "preparing";
+    storyRef.current.injuryAt = scenario.warmupSteps;
+    storyRef.current.endAt = scenario.warmupSteps + scenario.recoverySteps;
+    storyRef.current.startedAt = 0;
+    storyRef.current.injuryTriggered = false;
+    setStoryPhase("preparing");
+    updateStoryStatus("Story: preparing");
+    setStatus("initializing");
+    client.send({ type: "init", n: scenario.n, seed: scenario.seed });
+  };
+  const resetStory = () => {
+    const scenario = STORY_SCENARIOS[storyScenarioId];
+    const entry = PRESET_CATALOG.find((item) => item.id === scenario.presetId);
+    if (compareOn) {
+      const clientB = clientBRef.current;
+      if (!clientB) {
+        setError("Compare worker not ready yet.");
+        return;
+      }
+      if (status === "running") {
+        client.send({ type: "pause" });
+      }
+      if (entry) {
+        setPresetId(entry.id);
+        const applied = applyPreset(entry);
+        const paramsB = applyCompareControl(applied, compareControl);
+        storyRef.current.paramsApplied = applied;
+        abRef.current.paramsA = applied;
+        abRef.current.paramsB = paramsB;
+      }
+      storyRef.current.compareOn = true;
+      resetAbState();
+      setN(scenario.n);
+      setSeed(scenario.seed);
+      setInjuryMapOn(true);
+      setLifeHudOn(true);
+      setEvidenceOverlaysOn(true);
+      if (scenario.forceSStackMode) {
+        setSStackMode(scenario.forceSStackMode);
+        setSStackDiffIndex(0);
+        setSStackMetaStart(0);
+      }
+      storyRef.current.scenarioId = storyScenarioId;
+      storyRef.current.phase = "resetting";
+      storyRef.current.injuryAt = scenario.warmupSteps;
+      storyRef.current.endAt = scenario.warmupSteps + scenario.recoverySteps;
+      storyRef.current.startedAt = 0;
+      storyRef.current.injuryTriggered = false;
+      setStoryPhase("resetting");
+      updateStoryStatus("Story: reset");
+      setStatus("initializing");
+      client.send({ type: "init", n: scenario.n, seed: scenario.seed });
+      clientB.send({ type: "init", n: scenario.n, seed: scenario.seed });
+      return;
+    }
+    if (status === "running") {
+      client.send({ type: "pause" });
+    }
+    if (entry) {
+      setPresetId(entry.id);
+      const applied = applyPreset(entry);
+      storyRef.current.paramsApplied = applied;
+    }
+    setN(scenario.n);
+    setSeed(scenario.seed);
+    setInjuryMapOn(true);
+    setLifeHudOn(true);
+    setEvidenceOverlaysOn(true);
+    if (scenario.forceSStackMode) {
+      setSStackMode(scenario.forceSStackMode);
+      setSStackDiffIndex(0);
+      setSStackMetaStart(0);
+    }
+    storyRef.current.scenarioId = storyScenarioId;
+    storyRef.current.phase = "resetting";
+    storyRef.current.injuryAt = scenario.warmupSteps;
+    storyRef.current.endAt = scenario.warmupSteps + scenario.recoverySteps;
+    storyRef.current.startedAt = 0;
+    storyRef.current.injuryTriggered = false;
+    setStoryPhase("resetting");
+    updateStoryStatus("Story: reset");
+    setStatus("initializing");
+    client.send({ type: "init", n: scenario.n, seed: scenario.seed });
   };
 
   const showClockPanel =
@@ -2907,13 +3593,14 @@ export default function App() {
 
   const effectiveDraft = effectiveParams(paramsDraft);
   const activePrimitives = {
-    p1: effectiveDraft.pWrite > 0,
-    p2: effectiveDraft.pAWrite > 0,
-    p3: effectiveDraft.p3On > 0,
-    p4: effectiveDraft.pNWrite > 0,
-    p5: effectiveDraft.pSWrite > 0,
-    p6: effectiveDraft.p6On > 0,
+    p1: paramsApplied.pWrite > 0,
+    p2: paramsApplied.pAWrite > 0,
+    p3: paramsApplied.p3On > 0,
+    p4: paramsApplied.pNWrite > 0,
+    p5: paramsApplied.pSWrite > 0,
+    p6: paramsApplied.p6On > 0,
   };
+  const draftDirty = !shallowEqual(effectiveDraft, paramsApplied);
 
   const presetGroups = PRESET_CATALOG.reduce<Record<string, PresetEntry[]>>((acc, entry) => {
     acc[entry.group] = acc[entry.group] ?? [];
@@ -2946,6 +3633,7 @@ export default function App() {
             </button>
           </div>
         </div>
+        <div className="subtitle">github.com/ioannist/six-birds-life</div>
         {showHelp ? (
           <div className="helpBox">
             <div className="helpTitle">Getting started</div>
@@ -3240,6 +3928,14 @@ export default function App() {
               />
               <span>Evidence overlays</span>
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={lifeHudOn}
+                onChange={(e) => setLifeHudOn(e.target.checked)}
+              />
+              <span>Show Life HUD</span>
+            </label>
           </div>
         </div>
 
@@ -3283,7 +3979,11 @@ export default function App() {
                 applyPreset(entry);
               }
             }}
-            disabled={status === "idle" || status === "initializing"}
+            disabled={
+              status === "idle" ||
+              status === "initializing" ||
+              (storyPhase !== "idle" && storyPhase !== "done")
+            }
           >
             {Object.entries(presetGroups).map(([group, entries]) => (
               <optgroup label={group} key={group}>
@@ -3295,15 +3995,54 @@ export default function App() {
               </optgroup>
             ))}
           </select>
-          {selectedPreset?.supports && selectedPreset.supports.length > 0 ? (
-            <p style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
-              Supports: {selectedPreset.supports.join(", ")}
+          {selectedPreset?.tags && selectedPreset.tags.length > 0 ? (
+            <div
+              style={{
+                marginTop: 6,
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 6,
+                fontSize: 11,
+                color: "var(--muted)",
+              }}
+            >
+              {selectedPreset.tags.map((tag) => (
+                <span
+                  key={tag}
+                  style={{
+                    padding: "2px 8px",
+                    borderRadius: 999,
+                    border: "1px solid var(--border)",
+                    background: "rgba(255,255,255,0.04)",
+                  }}
+                >
+                  {tag}
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {selectedPreset?.blurb ? (
+            <p style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>{selectedPreset.blurb}</p>
+          ) : null}
+          {selectedPreset?.recommendedView ? (
+            <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+              Recommended view: {selectedPreset.recommendedView}
             </p>
           ) : null}
           {selectedPreset ? (
             <p style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
               Source: {selectedPreset.sourcePath}
             </p>
+          ) : null}
+          {selectedPreset?.supports && selectedPreset.supports.length > 0 ? (
+            <details style={{ marginTop: 4 }}>
+              <summary style={{ fontSize: 12, color: "var(--muted)", cursor: "pointer" }}>
+                Technical
+              </summary>
+              <div style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+                Supports: {selectedPreset.supports.join(", ")}
+              </div>
+            </details>
           ) : null}
           <p
             style={{
@@ -3332,7 +4071,98 @@ export default function App() {
             <span style={{ color: activePrimitives.p6 ? "#8de0c6" : "#ff9aa2" }}>
               P6{activePrimitives.p6 ? "✅" : "❌"}
             </span>
+            {draftDirty ? (
+              <span style={{ marginLeft: 6, color: "var(--muted)" }}>(unsaved changes)</span>
+            ) : null}
           </p>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label>Story Mode</label>
+          <select
+            value={storyScenarioId}
+            onChange={(e) => setStoryScenarioId(e.target.value as StoryScenarioId)}
+            disabled={status === "initializing" || (storyPhase !== "idle" && storyPhase !== "done")}
+          >
+            {Object.entries(STORY_SCENARIO_META).map(([id, meta]) => (
+              <option value={id} key={id}>
+                {meta.label}
+              </option>
+            ))}
+          </select>
+          {storyMeta?.description?.length ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
+              {storyMeta.description.map((line, idx) => (
+                <div key={`${storyMeta.label}-${idx}`}>{line}</div>
+              ))}
+            </div>
+          ) : null}
+          {storyPresetEntry ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
+              Preset: {storyPresetEntry.label}
+            </div>
+          ) : null}
+          {storyMeta?.recommendedCompareControl && !compareOn ? (
+            <div style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+              Recommended: Compare A/B → {COMPARE_CONTROL_LABELS[storyMeta.recommendedCompareControl]}
+            </div>
+          ) : null}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="checkbox"
+                checked={compareOn}
+                onChange={(e) => setCompareOn(e.target.checked)}
+                disabled={storyPhase !== "idle" && storyPhase !== "done"}
+              />
+              <span>Compare A/B</span>
+            </label>
+            {compareOn ? (
+              <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span>Control</span>
+                <select
+                  value={compareControl}
+                  onChange={(e) => setCompareControl(e.target.value as CompareControlId)}
+                  disabled={storyPhase !== "idle" && storyPhase !== "done"}
+                >
+                  <option value="no_repair">{COMPARE_CONTROL_LABELS.no_repair}</option>
+                  <option value="no_eta">{COMPARE_CONTROL_LABELS.no_eta}</option>
+                  <option value="no_p6">{COMPARE_CONTROL_LABELS.no_p6}</option>
+                </select>
+              </label>
+            ) : null}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button
+              type="button"
+              onClick={startStory}
+              disabled={
+                status === "initializing" ||
+                (storyPhase !== "idle" && storyPhase !== "done") ||
+                (compareOn && !compareReady)
+              }
+            >
+              Start demo
+            </button>
+            <button type="button" onClick={resetStory} disabled={storyPhase === "idle"}>
+              Stop/Reset
+            </button>
+          </div>
+          {compareOn ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "var(--muted)" }}>
+              A: Full system · B: Control: {COMPARE_CONTROL_LABELS[compareControl]}
+            </div>
+          ) : null}
+          <div
+            style={{
+              marginTop: 6,
+              fontSize: 12,
+              color: "var(--muted)",
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            }}
+          >
+            {storyStatus}
+          </div>
         </div>
 
         {overlayChannel.startsWith("meta") ? (
@@ -4373,6 +5203,16 @@ export default function App() {
                       <option value="diff_meta">Diff: |Meta(k) − Meta(k+1)|</option>
                     </select>
                   </label>
+                  {sStackMode === "diff_base" ? (
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="checkbox"
+                        checked={injuryMapOn}
+                        onChange={(e) => setInjuryMapOn(e.target.checked)}
+                      />
+                      <span>Injury map overlay</span>
+                    </label>
+                  ) : null}
                   {sStackMode === "diff_meta" ? (
                     <label>
                       k
@@ -4452,6 +5292,52 @@ export default function App() {
             {certPassed.codeMaint && <span className="certBadge">✅ Code Maint</span>}
           </div>
         )}
+
+        {compareOn && storyPhase !== "idle" ? (
+          <div
+            style={{
+              margin: "0 16px 12px",
+              padding: "12px",
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              background: "rgba(255, 255, 255, 0.03)",
+            }}
+          >
+            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+              A/B injury compare
+            </div>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 260px", minWidth: 220 }}>
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>A: Full system</div>
+                <canvas
+                  ref={abDiffARef}
+                  style={{
+                    width: "100%",
+                    aspectRatio: "1 / 1",
+                    borderRadius: 10,
+                    border: "1px solid var(--border)",
+                    background: "rgba(0, 0, 0, 0.2)",
+                  }}
+                />
+              </div>
+              <div style={{ flex: "1 1 260px", minWidth: 220 }}>
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>
+                  B: {COMPARE_CONTROL_LABELS[compareControl]}
+                </div>
+                <canvas
+                  ref={abDiffBRef}
+                  style={{
+                    width: "100%",
+                    aspectRatio: "1 / 1",
+                    borderRadius: 10,
+                    border: "1px solid var(--border)",
+                    background: "rgba(0, 0, 0, 0.2)",
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         <div className="chartsPanel">
           {metaLayerCount >= 2 && metaAlignCurrent ? (
